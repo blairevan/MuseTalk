@@ -3,6 +3,16 @@ import cv2
 import math
 import copy
 import torch
+
+# --- PyTorch 2.6+ Compatibility Monkey Patch ---
+_original_load = torch.load
+def _patched_load(*args, **kwargs):
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return _original_load(*args, **kwargs)
+torch.load = _patched_load
+# ---------------------------------------------
+
 import glob
 import shutil
 import pickle

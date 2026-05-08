@@ -4,6 +4,16 @@ from omegaconf import OmegaConf
 import numpy as np
 import cv2
 import torch
+
+# --- PyTorch 2.6+ Compatibility Monkey Patch ---
+_original_load = torch.load
+def _patched_load(*args, **kwargs):
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return _original_load(*args, **kwargs)
+torch.load = _patched_load
+# ---------------------------------------------
+
 import glob
 import pickle
 import sys
@@ -96,7 +106,7 @@ class Avatar:
                     osmakedirs([self.avatar_path, self.full_imgs_path, self.video_out_path, self.mask_out_path])
                     self.prepare_material()
                 else:
-                    self.input_latent_list_cycle = torch.load(self.latents_out_path)
+                    self.input_latent_list_cycle = torch.load(self.latents_out_path, weights_only=False)
                     with open(self.coords_path, 'rb') as f:
                         self.coord_list_cycle = pickle.load(f)
                     input_img_list = glob.glob(os.path.join(self.full_imgs_path, '*.[jpJP][pnPN]*[gG]'))
@@ -133,7 +143,7 @@ class Avatar:
                 else:
                     sys.exit()
             else:
-                self.input_latent_list_cycle = torch.load(self.latents_out_path)
+                self.input_latent_list_cycle = torch.load(self.latents_out_path, weights_only=False)
                 with open(self.coords_path, 'rb') as f:
                     self.coord_list_cycle = pickle.load(f)
                 input_img_list = glob.glob(os.path.join(self.full_imgs_path, '*.[jpJP][pnPN]*[gG]'))
