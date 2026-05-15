@@ -26,7 +26,7 @@ from musetalk.utils.face_parsing import FaceParsing
 from musetalk.utils.utils import datagen
 from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs
 from musetalk.utils.blending import get_image_prepare_material, get_image_blending
-from musetalk.utils.utils import load_all_model
+from musetalk.utils.utils import load_all_model, get_video_fps, get_file_type
 from musetalk.utils.audio_processor import AudioProcessor
 
 import shutil
@@ -335,7 +335,7 @@ if __name__ == "__main__":
     parser.add_argument("--bbox_shift", type=int, default=0, help="Bounding box shift value")
     parser.add_argument("--result_dir", default='./results', help="Directory for output results")
     parser.add_argument("--extra_margin", type=int, default=10, help="Extra margin for face cropping")
-    parser.add_argument("--fps", type=int, default=25, help="Video frames per second")
+    parser.add_argument("--fps", type=float, default=25, help="Video frames per second")
     parser.add_argument("--audio_padding_length_left", type=int, default=2, help="Left padding length for audio")
     parser.add_argument("--audio_padding_length_right", type=int, default=2, help="Right padding length for audio")
     parser.add_argument("--batch_size", type=int, default=20, help="Batch size for inference")
@@ -410,10 +410,15 @@ if __name__ == "__main__":
             batch_size=args.batch_size,
             preparation=data_preparation)
 
+        if get_file_type(video_path) == "video":
+            fps = get_video_fps(video_path)
+        else:
+            fps = args.fps
+
         audio_clips = inference_config[avatar_id]["audio_clips"]
         for audio_num, audio_path in audio_clips.items():
-            print("Inferring using:", audio_path)
+            print(f"Inferring using: {audio_path} at {fps} FPS")
             avatar.inference(audio_path,
                            audio_num,
-                           args.fps,
+                           fps,
                            args.skip_save_images)
