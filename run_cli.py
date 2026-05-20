@@ -1,7 +1,67 @@
 import argparse
 import os
+import sys
 import yaml
 import subprocess
+
+def validate_inputs(face_path, audio_path):
+    # Check if face_path exists and is non-empty
+    if not os.path.exists(face_path):
+        print(f"❌ 错误: 输入的 Face 文件/目录不存在: {face_path}")
+        return False
+    if not os.path.isdir(face_path) and os.path.getsize(face_path) == 0:
+        print(f"❌ 错误: 输入的 Face 文件为空 (0 字节): {face_path}")
+        return False
+        
+    # Check if audio_path exists and is non-empty
+    if not os.path.exists(audio_path):
+        print(f"❌ 错误: 输入的 Audio 文件不存在: {audio_path}")
+        return False
+    if os.path.getsize(audio_path) == 0:
+        print(f"❌ 错误: 输入的 Audio 文件为空 (0 字节): {audio_path}")
+        return False
+
+    # Check face path validity (video or image)
+    _, ext = os.path.splitext(face_path)
+    ext_lower = ext.lower()
+    if ext_lower in ['.avi', '.mp4', '.mov', '.flv', '.mkv']:
+        # Try to open with OpenCV
+        try:
+            import cv2
+            cap = cv2.VideoCapture(face_path)
+            if not cap.isOpened():
+                print(f"❌ 错误: 无法打开视频文件 {face_path}，文件可能损坏或写入不完整（如 moov atom 缺失）。")
+                cap.release()
+                return False
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            cap.release()
+            if fps <= 0:
+                print(f"❌ 错误: 视频文件 {face_path} 的帧率无效（{fps}），文件可能损坏或写入不完整。")
+                return False
+        except ImportError:
+            # If cv2 is not installed (though it should be), we fall back to a basic check
+            pass
+    elif ext_lower in ['.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff']:
+        try:
+            import cv2
+            img = cv2.imread(face_path)
+            if img is None or img.size == 0:
+                print(f"❌ 错误: 无法读取图像文件 {face_path}，文件可能损坏或不合法。")
+                return False
+        except ImportError:
+            pass
+    elif os.path.isdir(face_path):
+        # Check if directory contains images
+        import glob
+        img_list = glob.glob(os.path.join(face_path, '*.[jpJP][pnPN]*[gG]'))
+        if not img_list:
+            print(f"❌ 错误: 输入目录中未找到任何图片: {face_path}")
+            return False
+    else:
+        print(f"❌ 错误: 不支持的 Face 输入类型或后缀 {face_path}。")
+        return False
+
+    return True
 
 def main():
     parser = argparse.ArgumentParser(description="MuseTalk CLI Wrapper")
@@ -16,6 +76,10 @@ def main():
     face_path = os.path.abspath(args.face)
     audio_path = os.path.abspath(args.audio)
     outfile_path = os.path.abspath(args.outfile)
+
+    # 验证输入文件的有效性
+    if not validate_inputs(face_path, audio_path):
+        sys.exit(1)
 
     # MuseTalk 默认是通过 yaml 配置文件来执行批量任务的，为了支持单次 CLI 调用，这里动态生成一个临时的 yaml
     config_dict = {
@@ -46,7 +110,7 @@ def main():
 
     # 组装最终的底层调用命令
     cmd = [
-        "python", "-m", "scripts.inference",
+        sys.executable, "-m", "scripts.inference",
         "--inference_config", temp_yaml,
         "--result_dir", out_dir,
         "--output_vid_name", outfile_path,  # 传入绝对路径，底层代码 os.path.join 遇到绝对路径会自动使用绝对路径
@@ -61,7 +125,8 @@ def main():
         subprocess.run(cmd, check=True)
         print(f"\n✅ 任务圆满完成！\n视频已保存至: {outfile_path}")
     except subprocess.CalledProcessError as e:
-        print(f"\n❌ 推理过程中发生错误。")
+        print(f"\n❌ 推理过程中发生错误。底层推理命令执行失败，请检查上方日志。")
+        sys.exit(1)
     finally:
         # 清理临时的 yaml 配置文件
         if os.path.exists(temp_yaml):
