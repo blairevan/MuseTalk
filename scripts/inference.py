@@ -192,24 +192,66 @@ def main(args):
             
             print(f"Number of frames: {len(frame_list)}")         
             
-            # Process each frame
+            # Process each frame (ensuring strict length alignment with frame_list to prevent cumulative index drift)
             input_latent_list = []
+            last_valid_bbox = None
+            last_valid_latents = None
+            
+            # Find the first valid bbox and latents as initial fallback
+            first_valid_bbox = None
+            first_valid_latents = None
             for bbox, frame in zip(coord_list, frame_list):
-                if bbox == coord_placeholder:
+                if bbox != coord_placeholder and (bbox[2]-bbox[0]) > 0 and (bbox[3]-bbox[1]) > 0:
+                    x1, y1, x2, y2 = bbox
+                    if args.version == "v15":
+                        y2 = y2 + args.extra_margin
+                        y2 = min(y2, frame.shape[0])
+                    crop_frame = frame[y1:y2, x1:x2]
+                    try:
+                        crop_frame = cv2.resize(crop_frame, (256,256), interpolation=cv2.INTER_LANCZOS4)
+                        first_valid_latents = vae.get_latents_for_unet(crop_frame)
+                        first_valid_bbox = bbox
+                        break
+                    except:
+                        continue
+            
+            # Absolute fallback if no valid face is found at all
+            if first_valid_bbox is None:
+                first_valid_bbox = [0, 0, 100, 100]
+                dummy = np.zeros((256, 256, 3), dtype=np.uint8)
+                first_valid_latents = vae.get_latents_for_unet(dummy)
+
+            last_valid_bbox = first_valid_bbox
+            last_valid_latents = first_valid_latents
+
+            for idx, (bbox, frame) in enumerate(zip(coord_list, frame_list)):
+                if bbox == coord_placeholder or (bbox[2]-bbox[0]) <= 0 or (bbox[3]-bbox[1]) <= 0:
+                    # Face detection failed, fallback to previous valid frame data without skipping
+                    coord_list[idx] = last_valid_bbox
+                    input_latent_list.append(last_valid_latents)
                     continue
+                
                 x1, y1, x2, y2 = bbox
                 if args.version == "v15":
                     y2 = y2 + args.extra_margin
                     y2 = min(y2, frame.shape[0])
+                
                 crop_frame = frame[y1:y2, x1:x2]
-                crop_frame = cv2.resize(crop_frame, (256,256), interpolation=cv2.INTER_LANCZOS4)
-                latents = vae.get_latents_for_unet(crop_frame)
-                input_latent_list.append(latents)
+                try:
+                    crop_frame = cv2.resize(crop_frame, (256,256), interpolation=cv2.INTER_LANCZOS4)
+                    latents = vae.get_latents_for_unet(crop_frame)
+                    last_valid_bbox = [x1, y1, x2, y2]
+                    last_valid_latents = latents
+                    input_latent_list.append(latents)
+                except Exception as e:
+                    # Fallback on resize/extraction failures
+                    coord_list[idx] = last_valid_bbox
+                    input_latent_list.append(last_valid_latents)
         
-            # Smooth first and last frames
-            frame_list_cycle = frame_list + frame_list[::-1]
-            coord_list_cycle = coord_list + coord_list[::-1]
-            input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
+            # Pure forward loop (Loop Mode) instead of double-sided Mirror Cycle, eliminating muscle reverse tear
+            frame_list_cycle = frame_list
+            coord_list_cycle = coord_list
+            input_latent_list_cycle = input_latent_list
             
             # Batch inference
             print("Starting inference")
@@ -242,20 +284,30 @@ def main(args):
                 bbox = coord_list_cycle[i%(len(coord_list_cycle))]
                 ori_frame = copy.deepcopy(frame_list_cycle[i%(len(frame_list_cycle))])
                 x1, y1, x2, y2 = bbox
+                
+                # If no face is detected or coordinate is invalid, fallback to original frame to avoid sequence gap
+                if bbox == coord_placeholder or (x2 - x1) <= 0 or (y2 - y1) <= 0:
+                    cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", ori_frame)
+                    continue
+                
                 if args.version == "v15":
                     y2 = y2 + args.extra_margin
                     y2 = min(y2, frame.shape[0])
                 try:
                     res_frame = cv2.resize(res_frame.astype(np.uint8), (x2-x1, y2-y1))
-                except:
+                except Exception as e:
+                    cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", ori_frame)
                     continue
                 
                 # Merge results with version-specific parameters
-                if args.version == "v15":
-                    combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
-                else:
-                    combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], fp=fp)
-                cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", combine_frame)
+                try:
+                    if args.version == "v15":
+                        combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+                    else:
+                        combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], fp=fp)
+                    cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", combine_frame)
+                except Exception as e:
+                    cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", ori_frame)
 
             # Save prediction results
             temp_vid_path = f"{temp_dir}/temp_{input_basename}_{audio_basename}.mp4"

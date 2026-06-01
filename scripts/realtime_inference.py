@@ -174,26 +174,61 @@ class Avatar:
         print("extracting landmarks...")
         coord_list, frame_list = get_landmark_and_bbox(input_img_list, self.bbox_shift)
         input_latent_list = []
-        idx = -1
-        # maker if the bbox is not sufficient
         coord_placeholder = (0.0, 0.0, 0.0, 0.0)
+        
+        # Find the first valid bbox and latents as initial fallback
+        first_valid_bbox = None
+        first_valid_latents = None
         for bbox, frame in zip(coord_list, frame_list):
-            idx = idx + 1
-            if bbox == coord_placeholder:
+            if bbox != coord_placeholder and (bbox[2]-bbox[0]) > 0 and (bbox[3]-bbox[1]) > 0:
+                x1, y1, x2, y2 = bbox
+                if args.version == "v15":
+                    y2 = y2 + args.extra_margin
+                    y2 = min(y2, frame.shape[0])
+                crop_frame = frame[y1:y2, x1:x2]
+                try:
+                    crop_frame = cv2.resize(crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
+                    first_valid_latents = vae.get_latents_for_unet(crop_frame)
+                    first_valid_bbox = bbox
+                    break
+                except:
+                    continue
+        
+        if first_valid_bbox is None:
+            first_valid_bbox = [0, 0, 100, 100]
+            dummy = np.zeros((256, 256, 3), dtype=np.uint8)
+            first_valid_latents = vae.get_latents_for_unet(dummy)
+
+        last_valid_bbox = first_valid_bbox
+        last_valid_latents = first_valid_latents
+
+        for idx, (bbox, frame) in enumerate(zip(coord_list, frame_list)):
+            if bbox == coord_placeholder or (bbox[2]-bbox[0]) <= 0 or (bbox[3]-bbox[1]) <= 0:
+                coord_list[idx] = last_valid_bbox
+                input_latent_list.append(last_valid_latents)
                 continue
+            
             x1, y1, x2, y2 = bbox
             if args.version == "v15":
                 y2 = y2 + args.extra_margin
                 y2 = min(y2, frame.shape[0])
-                coord_list[idx] = [x1, y1, x2, y2]  # 更新coord_list中的bbox
+                coord_list[idx] = [x1, y1, x2, y2]
+                
             crop_frame = frame[y1:y2, x1:x2]
-            resized_crop_frame = cv2.resize(crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
-            latents = vae.get_latents_for_unet(resized_crop_frame)
-            input_latent_list.append(latents)
+            try:
+                resized_crop_frame = cv2.resize(crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
+                latents = vae.get_latents_for_unet(resized_crop_frame)
+                last_valid_bbox = coord_list[idx]
+                last_valid_latents = latents
+                input_latent_list.append(latents)
+            except Exception as e:
+                coord_list[idx] = last_valid_bbox
+                input_latent_list.append(last_valid_latents)
 
-        self.frame_list_cycle = frame_list + frame_list[::-1]
-        self.coord_list_cycle = coord_list + coord_list[::-1]
-        self.input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
+        # Pure forward loop (Loop Mode) instead of double-sided Mirror Cycle, eliminating muscle reverse tear
+        self.frame_list_cycle = frame_list
+        self.coord_list_cycle = coord_list
+        self.input_latent_list_cycle = input_latent_list
         self.mask_coords_list_cycle = []
         self.mask_list_cycle = []
 
@@ -230,19 +265,37 @@ class Avatar:
             except queue.Empty:
                 continue
 
+            coord_placeholder = (0.0, 0.0, 0.0, 0.0)
             bbox = self.coord_list_cycle[self.idx % (len(self.coord_list_cycle))]
             ori_frame = copy.deepcopy(self.frame_list_cycle[self.idx % (len(self.frame_list_cycle))])
             x1, y1, x2, y2 = bbox
+            
+            # If coordinates are invalid, save original frame to maintain sequence continuity
+            if bbox == coord_placeholder or (x2 - x1) <= 0 or (y2 - y1) <= 0:
+                if skip_save_images is False:
+                    cv2.imwrite(f"{self.avatar_path}/tmp/{str(self.idx).zfill(8)}.png", ori_frame)
+                self.idx = self.idx + 1
+                continue
+                
             try:
                 res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
-            except:
+            except Exception as e:
+                if skip_save_images is False:
+                    cv2.imwrite(f"{self.avatar_path}/tmp/{str(self.idx).zfill(8)}.png", ori_frame)
+                self.idx = self.idx + 1
                 continue
+                
             mask = self.mask_list_cycle[self.idx % (len(self.mask_list_cycle))]
             mask_crop_box = self.mask_coords_list_cycle[self.idx % (len(self.mask_coords_list_cycle))]
-            combine_frame = get_image_blending(ori_frame,res_frame,bbox,mask,mask_crop_box)
-
-            if skip_save_images is False:
-                cv2.imwrite(f"{self.avatar_path}/tmp/{str(self.idx).zfill(8)}.png", combine_frame)
+            
+            try:
+                combine_frame = get_image_blending(ori_frame, res_frame, bbox, mask, mask_crop_box)
+                if skip_save_images is False:
+                    cv2.imwrite(f"{self.avatar_path}/tmp/{str(self.idx).zfill(8)}.png", combine_frame)
+            except Exception as e:
+                if skip_save_images is False:
+                    cv2.imwrite(f"{self.avatar_path}/tmp/{str(self.idx).zfill(8)}.png", ori_frame)
+                    
             self.idx = self.idx + 1
 
     @torch.no_grad()
