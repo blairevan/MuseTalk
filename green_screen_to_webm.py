@@ -50,14 +50,14 @@ def convert(
     input_path: str,
     output_path: str,
     key_color: str = "0x00FF00",
-    similarity: float = 0.15,
-    blend: float = 0.1,
+    similarity: float = 0.1,
+    blend: float = 0.3,
     bitrate: str = "3M",
     use_colorkey: bool = True,
     no_audio: bool = False,
     despill: bool = True,
     despill_factor: float = 0.5,
-    crop_pixels: int = 0,
+    crop_pixels: int = 20,
     alpha_erode: int = 0,
 ) -> bool:
     """
@@ -189,14 +189,14 @@ Examples:
     parser.add_argument("-i", "--input", required=True, help="Input MP4 file path")
     parser.add_argument("-o", "--output", default=None, help="Output WebM file path (default: same name with .webm extension)")
     parser.add_argument("--key-color", default="0x00FF00", help="Chroma key color hex (default: 0x00FF00)")
-    parser.add_argument("--similarity", type=float, default=0.15, help="Similarity threshold 0~1 (default: 0.15, lower = stricter)")
-    parser.add_argument("--blend", type=float, default=0.1, help="Blend softness 0~1 (default: 0.1, higher = smoother edges)")
+    parser.add_argument("--similarity", type=float, default=0.1, help="Similarity threshold 0~1 (default: 0.1, lower = stricter)")
+    parser.add_argument("--blend", type=float, default=0.3, help="Blend softness 0~1 (default: 0.3, higher = smoother edges)")
     parser.add_argument("--bitrate", default="3M", help="Video bitrate (default: 3M)")
     parser.add_argument("--chromakey", action="store_true", help="Use chromakey filter instead of colorkey")
     parser.add_argument("--no-audio", action="store_true", help="Remove audio from output")
     parser.add_argument("--no-despill", action="store_true", help="Disable despill filter")
     parser.add_argument("--despill-factor", type=float, default=0.5, help="Despill strength 0~1 (default: 0.5)")
-    parser.add_argument("--crop", type=int, default=0, help="Crop N pixels from all edges to remove compression artifacts (default: 0)")
+    parser.add_argument("--crop", type=int, default=20, help="Crop N pixels from all edges to remove compression artifacts (default: 20)")
     parser.add_argument("--alpha-erode", type=int, default=0, help="Shrink alpha channel edges by N pixels to remove white borders (default: 0)")
 
     args = parser.parse_args()
