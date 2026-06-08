@@ -32,7 +32,7 @@ def face_seg(image, mode="raw", fp=None):
     return seg_image
 
 
-def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode="raw", fp=None, mask_dilate=0):
+def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode="raw", fp=None):
     """
     将裁剪的面部图像粘贴回原始图像，并进行一些处理。
 
@@ -42,8 +42,7 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
         face_box (tuple): 面部边界框的坐标 (x, y, x1, y1)。
         upper_boundary_ratio (float): 用于控制面部区域的保留比例。
         expand (float): 扩展因子，用于放大裁剪框。
-        mode: 融合mask构建方式
-        mask_dilate: mask膨胀像素数，用于将过渡区域推向绿幕背景（绿幕抠像场景使用）
+        mode: 融合mask构建方式 
 
     Returns:
         numpy.ndarray: 处理后的图像。
@@ -82,13 +81,6 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
     blur_kernel_size = int(0.05 * ori_shape[0] // 2 * 2) + 1  # 计算模糊核大小
     mask_array = cv2.GaussianBlur(np.array(modified_mask_image), (blur_kernel_size, blur_kernel_size), 0)  # 高斯模糊
     #mask_array = np.array(modified_mask_image)
-
-    # 膨胀mask，将过渡区域从人物轮廓推向绿幕背景
-    # 这样在绿幕抠像时，过渡像素会随绿幕一起被去除，消除白边
-    if mask_dilate > 0:
-        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (mask_dilate * 2 + 1, mask_dilate * 2 + 1))
-        mask_array = cv2.dilate(mask_array, dilate_kernel, iterations=1)
-
     mask_image = Image.fromarray(mask_array)  # 将模糊后的掩码转换回 PIL 图像
     
     # 将裁剪的面部图像粘贴回扩展后的面部区域
@@ -117,7 +109,7 @@ def get_image_blending(image, face, face_box, mask_array, crop_box):
     return body[:,:,::-1]
 
 
-def get_image_prepare_material(image, face_box, upper_boundary_ratio=0.5, expand=1.5, fp=None, mode="raw", mask_dilate=0):
+def get_image_prepare_material(image, face_box, upper_boundary_ratio=0.5, expand=1.5, fp=None, mode="raw"):
     body = Image.fromarray(image[:,:,::-1])
 
     x, y, x1, y1 = face_box
@@ -141,10 +133,4 @@ def get_image_prepare_material(image, face_box, upper_boundary_ratio=0.5, expand
 
     blur_kernel_size = int(0.1 * ori_shape[0] // 2 * 2) + 1
     mask_array = cv2.GaussianBlur(np.array(modified_mask_image), (blur_kernel_size, blur_kernel_size), 0)
-
-    # Dilate mask to push transition zone onto green background (for green screen keying)
-    if mask_dilate > 0:
-        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (mask_dilate * 2 + 1, mask_dilate * 2 + 1))
-        mask_array = cv2.dilate(mask_array, dilate_kernel, iterations=1)
-
     return mask_array, crop_box

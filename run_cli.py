@@ -69,7 +69,6 @@ def main():
     parser.add_argument("--audio", type=str, required=True, help="Input audio path")
     parser.add_argument("--outfile", type=str, required=True, help="Output video path (must be a specific .mp4 file)")
     parser.add_argument("--version", type=str, default="v1.5", choices=["v1.0", "v1.5"])
-    parser.add_argument("--mask_dilate", type=int, default=0, help="膨胀融合mask像素数，用于绿幕抠像场景消除白边（默认: 0）")
     
     args = parser.parse_args()
 
@@ -117,8 +116,7 @@ def main():
         "--output_vid_name", outfile_path,  # 传入绝对路径，底层代码 os.path.join 遇到绝对路径会自动使用绝对路径
         "--unet_model_path", unet_model_path,
         "--unet_config", unet_config,
-        "--version", version_arg,
-        "--mask_dilate", str(args.mask_dilate)
+        "--version", version_arg
     ]
     
     print(f"🚀 开始执行数字人合成任务...\n底层调用命令: {' '.join(cmd)}\n")
