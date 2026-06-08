@@ -302,9 +302,9 @@ def main(args):
                 # Merge results with version-specific parameters
                 try:
                     if args.version == "v15":
-                        combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+                        combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp, mask_dilate=args.mask_dilate)
                     else:
-                        combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], fp=fp)
+                        combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], fp=fp, mask_dilate=args.mask_dilate)
                     cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", combine_frame)
                 except Exception as e:
                     cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", ori_frame)
@@ -360,5 +360,6 @@ if __name__ == "__main__":
     parser.add_argument("--left_cheek_width", type=int, default=90, help="Width of left cheek region")
     parser.add_argument("--right_cheek_width", type=int, default=90, help="Width of right cheek region")
     parser.add_argument("--version", type=str, default="v15", choices=["v1", "v15"], help="Model version to use")
+    parser.add_argument("--mask_dilate", type=int, default=0, help="Dilate blending mask by N pixels to push transition zone onto green background (use for green screen keying, default: 0)")
     args = parser.parse_args()
     main(args)
