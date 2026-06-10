@@ -69,6 +69,10 @@ def main():
     parser.add_argument("--audio", type=str, required=True, help="Input audio path")
     parser.add_argument("--outfile", type=str, required=True, help="Output video path (must be a specific .mp4 file)")
     parser.add_argument("--version", type=str, default="v1.5", choices=["v1.0", "v1.5"])
+    parser.add_argument("--extra_margin", type=int, default=10, help="Extra margin for face cropping")
+    parser.add_argument("--parsing_mode", type=str, default="jaw", choices=["jaw", "raw"], help="Face blending parsing mode")
+    parser.add_argument("--left_cheek_width", type=int, default=90, help="Width of left cheek editing region")
+    parser.add_argument("--right_cheek_width", type=int, default=90, help="Width of right cheek editing region")
     
     args = parser.parse_args()
 
@@ -116,7 +120,11 @@ def main():
         "--output_vid_name", outfile_path,  # 传入绝对路径，底层代码 os.path.join 遇到绝对路径会自动使用绝对路径
         "--unet_model_path", unet_model_path,
         "--unet_config", unet_config,
-        "--version", version_arg
+        "--version", version_arg,
+        "--extra_margin", str(args.extra_margin),
+        "--parsing_mode", args.parsing_mode,
+        "--left_cheek_width", str(args.left_cheek_width),
+        "--right_cheek_width", str(args.right_cheek_width)
     ]
     
     print(f"🚀 开始执行数字人合成任务...\n底层调用命令: {' '.join(cmd)}\n")
