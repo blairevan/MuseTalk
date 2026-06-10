@@ -30,7 +30,51 @@ from musetalk.utils.audio_processor import AudioProcessor
 from musetalk.utils.utils import get_file_type, get_video_fps, datagen, load_all_model
 from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder
 
+def smooth_bbox_sequence(coord_list, window_size):
+    """Smooth valid face bounding boxes while stabilizing crop scale over time."""
+    if window_size <= 1:
+        return coord_list
+
+    half_window = window_size // 2
+    smoothed_coords = []
+    valid_coords = [
+        None if bbox == coord_placeholder else np.asarray(bbox, dtype=np.float32)
+        for bbox in coord_list
+    ]
+
+    for index, current_bbox in enumerate(valid_coords):
+        if current_bbox is None:
+            smoothed_coords.append(coord_placeholder)
+            continue
+
+        start = max(0, index - half_window)
+        end = min(len(valid_coords), index + half_window + 1)
+        window_coords = [bbox for bbox in valid_coords[start:end] if bbox is not None]
+        if not window_coords:
+            smoothed_coords.append(coord_list[index])
+            continue
+
+        window_array = np.asarray(window_coords, dtype=np.float32)
+        centers_x = (window_array[:, 0] + window_array[:, 2]) / 2.0
+        centers_y = (window_array[:, 1] + window_array[:, 3]) / 2.0
+        widths = window_array[:, 2] - window_array[:, 0]
+        heights = window_array[:, 3] - window_array[:, 1]
+
+        center_x = float(np.mean(centers_x))
+        center_y = float(np.mean(centers_y))
+        width = float(np.median(widths))
+        height = float(np.median(heights))
+
+        x1 = int(round(center_x - width / 2.0))
+        y1 = int(round(center_y - height / 2.0))
+        x2 = int(round(center_x + width / 2.0))
+        y2 = int(round(center_y + height / 2.0))
+        smoothed_coords.append([x1, y1, x2, y2])
+
+    return smoothed_coords
+
 def fast_check_ffmpeg():
+    """Return whether ffmpeg is available in the current PATH."""
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
         return True
@@ -189,6 +233,10 @@ def main(args):
                 coord_list, frame_list = get_landmark_and_bbox(input_img_list, bbox_shift)
                 with open(crop_coord_save_path, 'wb') as f:
                     pickle.dump(coord_list, f)
+            
+            if args.bbox_smooth_window > 1:
+                print(f"Smoothing bbox coordinates with window size: {args.bbox_smooth_window}")
+                coord_list = smooth_bbox_sequence(coord_list, args.bbox_smooth_window)
             
             print(f"Number of frames: {len(frame_list)}")         
             
@@ -359,6 +407,7 @@ if __name__ == "__main__":
     parser.add_argument("--parsing_mode", default='jaw', help="Face blending parsing mode")
     parser.add_argument("--left_cheek_width", type=int, default=90, help="Width of left cheek region")
     parser.add_argument("--right_cheek_width", type=int, default=90, help="Width of right cheek region")
+    parser.add_argument("--bbox_smooth_window", type=int, default=1, help="Centered moving-average window for bbox smoothing; 1 disables smoothing")
     parser.add_argument("--version", type=str, default="v15", choices=["v1", "v15"], help="Model version to use")
     args = parser.parse_args()
     main(args)

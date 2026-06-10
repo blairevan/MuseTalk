@@ -73,6 +73,7 @@ def main():
     parser.add_argument("--parsing_mode", type=str, default="jaw", choices=["jaw", "raw"], help="Face blending parsing mode")
     parser.add_argument("--left_cheek_width", type=int, default=90, help="Width of left cheek editing region")
     parser.add_argument("--right_cheek_width", type=int, default=90, help="Width of right cheek editing region")
+    parser.add_argument("--bbox_smooth_window", type=int, default=1, help="Centered moving-average window for bbox smoothing; 1 disables smoothing")
     
     args = parser.parse_args()
 
@@ -124,7 +125,8 @@ def main():
         "--extra_margin", str(args.extra_margin),
         "--parsing_mode", args.parsing_mode,
         "--left_cheek_width", str(args.left_cheek_width),
-        "--right_cheek_width", str(args.right_cheek_width)
+        "--right_cheek_width", str(args.right_cheek_width),
+        "--bbox_smooth_window", str(args.bbox_smooth_window)
     ]
     
     print(f"🚀 开始执行数字人合成任务...\n底层调用命令: {' '.join(cmd)}\n")
