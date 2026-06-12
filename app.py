@@ -32,9 +32,133 @@ from transformers import WhisperModel
 ProjectDir = os.path.abspath(os.path.dirname(__file__))
 CheckpointsDir = os.path.join(ProjectDir, "models")
 
+def draw_dashed_rectangle(image, point1, point2, color=(0, 0, 255), thickness=2, dash_length=12):
+    """Draw a dashed rectangle on an image and return the same image."""
+    image = np.ascontiguousarray(image)
+    x1, y1 = point1
+    x2, y2 = point2
+
+    for x in range(x1, x2, dash_length * 2):
+        cv2.line(image, (x, y1), (min(x + dash_length, x2), y1), color, thickness)
+        cv2.line(image, (x, y2), (min(x + dash_length, x2), y2), color, thickness)
+
+    for y in range(y1, y2, dash_length * 2):
+        cv2.line(image, (x1, y), (x1, min(y + dash_length, y2)), color, thickness)
+        cv2.line(image, (x2, y), (x2, min(y + dash_length, y2)), color, thickness)
+
+    return image
+
+def draw_debug_parameter_overlay(
+        image,
+        face_box,
+        original_bottom,
+        bbox_shift,
+        extra_margin,
+        parsing_mode,
+        left_cheek_width,
+        right_cheek_width):
+    """Draw visual guides for the main inpainting debug parameters."""
+    image = draw_dashed_rectangle(image, face_box[:2], face_box[2:])
+    x1, y1, x2, y2 = face_box
+    width = max(x2 - x1, 1)
+    center_x = x1 + width // 2
+    label_x = max(x1, 8)
+    label_y = max(y1 - 12, 24)
+
+    cv2.putText(
+        image,
+        f"mode={parsing_mode} shift={bbox_shift}",
+        (label_x, label_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 0, 255),
+        2,
+        cv2.LINE_AA
+    )
+
+    if extra_margin > 0 and original_bottom < y2:
+        cv2.line(image, (x1, original_bottom), (x2, original_bottom), (0, 255, 255), 2)
+        cv2.arrowedLine(image, (x2 + 12, original_bottom), (x2 + 12, y2), (0, 255, 255), 2, tipLength=0.25)
+        cv2.putText(
+            image,
+            f"extra_margin={extra_margin}",
+            (min(x2 + 18, image.shape[1] - 180), min(y2, image.shape[0] - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 255),
+            1,
+            cv2.LINE_AA
+        )
+
+    shift_end_y = int(np.clip(y1 + bbox_shift, 0, image.shape[0] - 1))
+    cv2.line(image, (center_x, y1), (center_x, y2), (255, 255, 255), 1)
+    if bbox_shift != 0:
+        cv2.arrowedLine(image, (center_x, y1), (center_x, shift_end_y), (255, 0, 255), 2, tipLength=0.25)
+
+    left_boundary = int(np.clip(center_x - left_cheek_width * width / 512, x1, x2))
+    right_boundary = int(np.clip(center_x + right_cheek_width * width / 512, x1, x2))
+    cv2.line(image, (left_boundary, y1), (left_boundary, y2), (255, 128, 0), 2)
+    cv2.line(image, (right_boundary, y1), (right_boundary, y2), (255, 128, 0), 2)
+    cv2.putText(
+        image,
+        f"L={left_cheek_width} R={right_cheek_width}",
+        (label_x, min(y2 + 24, image.shape[0] - 8)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (255, 128, 0),
+        1,
+        cv2.LINE_AA
+    )
+
+    return image
+
+def smooth_bbox_sequence(coord_list, window_size):
+    """Smooth valid face bounding boxes while stabilizing crop scale over time."""
+    if window_size <= 1:
+        return coord_list
+
+    half_window = window_size // 2
+    smoothed_coords = []
+    valid_coords = [
+        None if bbox == coord_placeholder else np.asarray(bbox, dtype=np.float32)
+        for bbox in coord_list
+    ]
+
+    for index, current_bbox in enumerate(valid_coords):
+        if current_bbox is None:
+            smoothed_coords.append(coord_placeholder)
+            continue
+
+        start = max(0, index - half_window)
+        end = min(len(valid_coords), index + half_window + 1)
+        window_coords = [bbox for bbox in valid_coords[start:end] if bbox is not None]
+        if not window_coords:
+            smoothed_coords.append(coord_list[index])
+            continue
+
+        window_array = np.asarray(window_coords, dtype=np.float32)
+        centers_x = (window_array[:, 0] + window_array[:, 2]) / 2.0
+        centers_y = (window_array[:, 1] + window_array[:, 3]) / 2.0
+        widths = window_array[:, 2] - window_array[:, 0]
+        heights = window_array[:, 3] - window_array[:, 1]
+
+        center_x = float(np.mean(centers_x))
+        center_y = float(np.mean(centers_y))
+        width = float(np.median(widths))
+        height = float(np.median(heights))
+
+        x1 = int(round(center_x - width / 2.0))
+        y1 = int(round(center_y - height / 2.0))
+        x2 = int(round(center_x + width / 2.0))
+        y2 = int(round(center_y + height / 2.0))
+        smoothed_coords.append([x1, y1, x2, y2])
+
+    return smoothed_coords
+
 @torch.no_grad()
-def debug_inpainting(video_path, bbox_shift, extra_margin=10, parsing_mode="jaw", 
-                    left_cheek_width=90, right_cheek_width=90):
+def debug_inpainting(video_path, version, bbox_shift, extra_margin=8, parsing_mode="jaw",
+                    left_cheek_width=120, right_cheek_width=120, bbox_smooth_window=7,
+                    show_face_coordinates=False):
     """Debug inpainting parameters, only process the first frame"""
     # Set default parameters
     args_dict = {
@@ -45,7 +169,7 @@ def debug_inpainting(video_path, bbox_shift, extra_margin=10, parsing_mode="jaw"
         "use_saved_coord": False,
         "audio_padding_length_left": 2,
         "audio_padding_length_right": 2,
-        "version": "v15",
+        "version": "v15" if version == "v1.5" else version,
         "extra_margin": extra_margin,
         "parsing_mode": parsing_mode,
         "left_cheek_width": left_cheek_width,
@@ -85,6 +209,7 @@ def debug_inpainting(video_path, bbox_shift, extra_margin=10, parsing_mode="jaw"
     
     # Process first frame
     x1, y1, x2, y2 = bbox
+    original_y2 = y2
     y2 = y2 + args.extra_margin
     y2 = min(y2, frame.shape[0])
     crop_frame = frame[y1:y2, x1:x2]
@@ -106,6 +231,18 @@ def debug_inpainting(video_path, bbox_shift, extra_margin=10, parsing_mode="jaw"
     res_frame = recon[0]
     res_frame = cv2.resize(res_frame.astype(np.uint8),(x2-x1,y2-y1))
     combine_frame = get_image(frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+
+    if show_face_coordinates:
+        combine_frame = draw_debug_parameter_overlay(
+            combine_frame,
+            (x1, y1, x2, y2),
+            original_y2,
+            bbox_shift,
+            extra_margin,
+            parsing_mode,
+            left_cheek_width,
+            right_cheek_width
+        )
     
     # Save results (no need to convert color space again since get_image already returns RGB format)
     debug_result_path = os.path.join(args.result_dir, "debug_result.png")
@@ -114,10 +251,12 @@ def debug_inpainting(video_path, bbox_shift, extra_margin=10, parsing_mode="jaw"
     # Create information text
     info_text = f"Parameter information:\n" + \
                 f"bbox_shift: {bbox_shift}\n" + \
+                f"version: {version}\n" + \
                 f"extra_margin: {extra_margin}\n" + \
                 f"parsing_mode: {parsing_mode}\n" + \
                 f"left_cheek_width: {left_cheek_width}\n" + \
                 f"right_cheek_width: {right_cheek_width}\n" + \
+                f"bbox_smooth_window: {bbox_smooth_window}\n" + \
                 f"Detected face coordinates: [{x1}, {y1}, {x2}, {y2}]"
     
     return cv2.cvtColor(combine_frame, cv2.COLOR_RGB2BGR), info_text
@@ -192,8 +331,9 @@ def fast_check_ffmpeg():
 
 
 @torch.no_grad()
-def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode="jaw", 
-              left_cheek_width=90, right_cheek_width=90, progress=gr.Progress(track_tqdm=True)):
+def inference(audio_path, video_path, version, bbox_shift, extra_margin=8, parsing_mode="jaw",
+              left_cheek_width=120, right_cheek_width=120, bbox_smooth_window=7,
+              progress=gr.Progress(track_tqdm=True)):
     # Set default parameters, aligned with inference.py
     args_dict = {
         "result_dir": './results/output', 
@@ -203,11 +343,12 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         "use_saved_coord": False,
         "audio_padding_length_left": 2,
         "audio_padding_length_right": 2,
-        "version": "v15",  # Fixed use v15 version
+        "version": "v15" if version == "v1.5" else version,
         "extra_margin": extra_margin,
         "parsing_mode": parsing_mode,
         "left_cheek_width": left_cheek_width,
-        "right_cheek_width": right_cheek_width
+        "right_cheek_width": right_cheek_width,
+        "bbox_smooth_window": bbox_smooth_window
     }
     args = Namespace(**args_dict)
 
@@ -275,6 +416,9 @@ def inference(audio_path, video_path, bbox_shift, extra_margin=10, parsing_mode=
         coord_list, frame_list = get_landmark_and_bbox(input_img_list, bbox_shift)
         with open(crop_coord_save_path, 'wb') as f:
             pickle.dump(coord_list, f)
+    if args.bbox_smooth_window > 1:
+        print(f"Smoothing bbox coordinates with window size: {args.bbox_smooth_window}")
+        coord_list = smooth_bbox_sequence(coord_list, args.bbox_smooth_window)
     bbox_shift_text = get_bbox_range(input_img_list, bbox_shift)
     
     # Initialize face parser
@@ -483,77 +627,127 @@ def check_video(video):
     return output_video
 
 
+def set_generate_running():
+    """Disable the generate button and show generation status."""
+    return (
+        gr.update(value="Generating...", interactive=False),
+        gr.update(value="正在生成视频，请稍候。页面会显示进度条，生成完成后按钮会自动恢复。", visible=True)
+    )
+
+
+def set_generate_idle():
+    """Restore the generate button and hide generation status."""
+    return (
+        gr.update(value="2. Generate", interactive=True),
+        gr.update(value="", visible=False)
+    )
+
 
 
 css = """#input_img {max-width: 1024px !important} #output_vid {max-width: 1024px; max-height: 576px}"""
 
 with gr.Blocks(css=css) as demo:
-    gr.Markdown(
-        """<div align='center'> <h1>MuseTalk: Real-Time High-Fidelity Video Dubbing via Spatio-Temporal Sampling</h1> \
-                    <h2 style='font-weight: 450; font-size: 1rem; margin: 0rem'>\
-                    </br>\
-                    Yue Zhang <sup>*</sup>,\
-                    Zhizhou Zhong <sup>*</sup>,\
-                    Minhao Liu<sup>*</sup>,\
-                    Zhaokang Chen,\
-                    Bin Wu<sup>†</sup>,\
-                    Yubin Zeng,\
-                    Chao Zhang,\
-                    Yingjie He,\
-                    Junxin Huang,\
-                    Wenjiang Zhou <br>\
-                    (<sup>*</sup>Equal Contribution, <sup>†</sup>Corresponding Author, benbinwu@tencent.com)\
-                    Lyra Lab, Tencent Music Entertainment\
-                </h2> \
-                <a style='font-size:18px;color: #000000' href='https://github.com/TMElyralab/MuseTalk'>[Github Repo]</a>\
-                <a style='font-size:18px;color: #000000' href='https://github.com/TMElyralab/MuseTalk'>[Huggingface]</a>\
-                <a style='font-size:18px;color: #000000' href='https://arxiv.org/abs/2410.10122'> [Technical report] </a>"""
-    )
+    with gr.Row():
+        version = gr.Radio(label="Version", choices=["v1.5"], value="v1.5")
+        bbox_shift = gr.Number(label="BBox_shift value, px", value=0)
+        extra_margin = gr.Slider(label="Extra Margin", minimum=0, maximum=40, value=8, step=1)
+        parsing_mode = gr.Radio(label="Parsing Mode", choices=["jaw", "raw"], value="jaw")
+        left_cheek_width = gr.Slider(label="Left Cheek Width", minimum=20, maximum=160, value=120, step=5)
+        right_cheek_width = gr.Slider(label="Right Cheek Width", minimum=20, maximum=160, value=120, step=5)
+        bbox_smooth_window = gr.Slider(label="BBox Smooth Window", minimum=1, maximum=15, value=7, step=2)
+        show_face_coordinates = gr.Checkbox(label="Show Detected Face Coordinates", value=True)
+
+    bbox_shift_scale = gr.Markdown(visible=False)
+
+    with gr.Row():
+        debug_btn = gr.Button("1. Test Inpainting ")
+        btn = gr.Button("2. Generate")
+    generate_status = gr.Markdown(visible=False)
 
     with gr.Row():
         with gr.Column():
-            audio = gr.Audio(label="Drving Audio",type="filepath")
             video = gr.Video(label="Reference Video",sources=['upload'])
-            bbox_shift = gr.Number(label="BBox_shift value, px", value=0)
-            extra_margin = gr.Slider(label="Extra Margin", minimum=0, maximum=40, value=10, step=1)
-            parsing_mode = gr.Radio(label="Parsing Mode", choices=["jaw", "raw"], value="jaw")
-            left_cheek_width = gr.Slider(label="Left Cheek Width", minimum=20, maximum=160, value=90, step=5)
-            right_cheek_width = gr.Slider(label="Right Cheek Width", minimum=20, maximum=160, value=90, step=5)
-            bbox_shift_scale = gr.Textbox(label="'left_cheek_width' and 'right_cheek_width' parameters determine the range of left and right cheeks editing when parsing model is 'jaw'. The 'extra_margin' parameter determines the movement range of the jaw. Users can freely adjust these three parameters to obtain better inpainting results.")
-
-            with gr.Row():
-                debug_btn = gr.Button("1. Test Inpainting ")
-                btn = gr.Button("2. Generate")
+            audio = gr.Audio(label="Drving Audio",type="filepath")
         with gr.Column():
             debug_image = gr.Image(label="Test Inpainting Result (First Frame)")
             debug_info = gr.Textbox(label="Parameter Information", lines=5)
             out1 = gr.Video()
+
+    gr.Markdown(
+        """
+### 参数说明
+
+- **BBox_shift value, px**：控制检测到的人脸框整体在垂直方向上的偏移。正值通常让编辑区域向下移动，嘴部张开效果可能更明显；负值通常让编辑区域向上移动，嘴部变化会更收敛。建议先点击 `1. Test Inpainting` 查看可调范围，再在范围内微调。
+- **Version**：当前页面加载的是 MuseTalk `v1.5` 权重，因此页面版本固定为 `v1.5`。
+- **Extra Margin**：在人脸框底部额外向下扩展的像素范围，主要影响下巴和 jaw 区域的融合空间。数值过小可能导致下巴附近融合不足，数值过大可能影响到脖子或衣领区域。
+- **Parsing Mode**：控制融合 mask 的构建方式。`jaw` 会更关注下颌和脸颊边界，通常适合真人视频；`raw` 更接近原始解析区域，适合在 `jaw` 出现边缘异常时对比排查。
+- **Left Cheek Width**：在 `jaw` 模式下控制左脸颊侧的编辑保护范围。数值越大，左侧脸颊参与编辑的范围越收敛；数值越小，左侧脸颊更容易被融合区域影响。
+- **Right Cheek Width**：在 `jaw` 模式下控制右脸颊侧的编辑保护范围。数值越大，右侧脸颊参与编辑的范围越收敛；数值越小，右侧脸颊更容易被融合区域影响。
+- **BBox Smooth Window**：对完整视频生成时的人脸框序列做居中滑动平滑，`1` 表示关闭。数值越大，框抖动越少，但过大可能让快速头部运动跟随变慢；常用值为 `5` 或 `7`。
+- **Show Detected Face Coordinates**：开启后，`1. Test Inpainting` 的预览图会叠加调试标注。红色虚线框表示最终检测框，黄色标注表示 `Extra Margin`，紫色箭头表示 `BBox_shift`，橙色竖线表示左右脸颊宽度的近似影响边界。
+
+建议调参顺序：先调 `BBox_shift value, px`，再调 `Extra Margin`，然后只在脸颊边缘异常时调整 `Left Cheek Width` 和 `Right Cheek Width`，最后根据视频抖动情况调整 `BBox Smooth Window`。
+
+### 推荐参数
+
+- **通用起始值**：`Version = v1.5`，`BBox_shift value, px = 0`，`Extra Margin = 8`，`Parsing Mode = jaw`，`Left Cheek Width = 120`，`Right Cheek Width = 120`，`BBox Smooth Window = 7`。
+- **嘴型张开不够**：优先把 `BBox_shift value, px` 往正数方向微调，例如 `3` 到 `8`；如果下巴融合空间不足，再把 `Extra Margin` 调到 `12` 到 `18`。
+- **嘴型变化过大或下巴变形**：优先把 `BBox_shift value, px` 往负数方向微调，例如 `-3` 到 `-8`；必要时降低 `Extra Margin`。
+- **脸颊边缘被明显改动**：在 `jaw` 模式下增大对应侧的 cheek width，例如把 `Left Cheek Width` 或 `Right Cheek Width` 从 `90` 调到 `110` 到 `130`。
+- **融合边缘不自然**：先保持 `Parsing Mode = jaw`，微调 `Extra Margin`；如果 jaw 模式边界异常明显，再切换到 `raw` 对比效果。
+
+### 常见问题：两边嘴角有黑点
+
+嘴角黑点通常是融合 mask 边缘或嘴角区域被过度编辑导致的。建议先勾选 `Show Detected Face Coordinates`，点击 `1. Test Inpainting` 查看红色检测框和橙色脸颊边界。
+
+- 优先增大左右脸颊保护范围：把 `Left Cheek Width` 和 `Right Cheek Width` 从 `90` 调到 `110` 或 `120`。
+- 如果黑点出现在下嘴角或下巴附近：把 `Extra Margin` 从 `10` 降到 `6` 或 `8`。
+- 如果黑点仍然存在：把 `BBox_shift value, px` 往负数方向微调，例如从 `5` 依次试 `2`、`0`、`-3`。
+- 如果 `jaw` 模式持续出现边缘异常：切换到 `raw` 对比一次。
+
+推荐尝试组合：`BBox_shift value, px = 0`，`Extra Margin = 8`，`Parsing Mode = jaw`，`Left Cheek Width = 120`，`Right Cheek Width = 120`。如果黑点消失但嘴型不够明显，再只把 `BBox_shift value, px` 从 `0` 微调到 `2` 到 `5`。
+"""
+    )
     
     video.change(
         fn=check_video, inputs=[video], outputs=[video]
     )
-    btn.click(
+    generate_event = btn.click(
+        fn=set_generate_running,
+        inputs=[],
+        outputs=[btn, generate_status]
+    )
+    generate_event.then(
         fn=inference,
         inputs=[
             audio,
             video,
+            version,
             bbox_shift,
             extra_margin,
             parsing_mode,
             left_cheek_width,
-            right_cheek_width
+            right_cheek_width,
+            bbox_smooth_window
         ],
         outputs=[out1,bbox_shift_scale]
+    ).then(
+        fn=set_generate_idle,
+        inputs=[],
+        outputs=[btn, generate_status]
     )
     debug_btn.click(
         fn=debug_inpainting,
         inputs=[
             video,
+            version,
             bbox_shift,
             extra_margin,
             parsing_mode,
             left_cheek_width,
-            right_cheek_width
+            right_cheek_width,
+            bbox_smooth_window,
+            show_face_coordinates
         ],
         outputs=[debug_image, debug_info]
     )
