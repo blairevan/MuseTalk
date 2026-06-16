@@ -292,6 +292,18 @@ python -m scripts.inference --inference_config configs\inference\test.yaml --res
 # - --version v15 -> --version v1
 ```
 
+#### CLI Wrapper Inference (run_cli.py)
+We provide a convenient CLI wrapper `run_cli.py` for direct inference without manually creating yaml configurations.
+
+##### Example Usage
+```bash
+python run_cli.py --face ./data/video/select_ref.mp4 --audio ./data/audio/monalisa.wav --outfile ./output/result.mp4 --model_version v1.5
+```
+
+For detailed parameters and micro-tuning guide, please refer to [run_cli_usage.md](file:///opt/app/aining/digital_human/MuseTalk/run_cli_usage.md).
+
+
+
 #### Real-time Inference
 ##### Linux Environment
 ```bash

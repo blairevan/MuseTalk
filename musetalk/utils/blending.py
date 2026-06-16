@@ -3,6 +3,8 @@ import numpy as np
 import cv2
 import copy
 
+from musetalk.utils.mask_utils import apply_side_protect_mask
+
 
 def get_crop_box(box, expand):
     x, y, x1, y1 = box
@@ -32,7 +34,8 @@ def face_seg(image, mode="raw", fp=None):
     return seg_image
 
 
-def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode="raw", fp=None):
+def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode="raw",
+              fp=None, side_protect_ratio=0.0):
     """
     将裁剪的面部图像粘贴回原始图像，并进行一些处理。
 
@@ -42,7 +45,8 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
         face_box (tuple): 面部边界框的坐标 (x, y, x1, y1)。
         upper_boundary_ratio (float): 用于控制面部区域的保留比例。
         expand (float): 扩展因子，用于放大裁剪框。
-        mode: 融合mask构建方式 
+        mode: 融合mask构建方式
+        side_protect_ratio: 左右边缘保护比例，用于降低耳朵和头发附近的融合强度。
 
     Returns:
         numpy.ndarray: 处理后的图像。
@@ -80,6 +84,8 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
     # 对掩码进行高斯模糊，使边缘更平滑
     blur_kernel_size = int(0.05 * ori_shape[0] // 2 * 2) + 1  # 计算模糊核大小
     mask_array = cv2.GaussianBlur(np.array(modified_mask_image), (blur_kernel_size, blur_kernel_size), 0)  # 高斯模糊
+    face_rect = (x - x_s, y - y_s, x1 - x_s, y1 - y_s)
+    mask_array = apply_side_protect_mask(mask_array, face_rect, side_protect_ratio)
     #mask_array = np.array(modified_mask_image)
     mask_image = Image.fromarray(mask_array)  # 将模糊后的掩码转换回 PIL 图像
     
@@ -109,7 +115,9 @@ def get_image_blending(image, face, face_box, mask_array, crop_box):
     return body[:,:,::-1]
 
 
-def get_image_prepare_material(image, face_box, upper_boundary_ratio=0.5, expand=1.5, fp=None, mode="raw"):
+def get_image_prepare_material(image, face_box, upper_boundary_ratio=0.5, expand=1.5,
+                               fp=None, mode="raw", side_protect_ratio=0.0):
+    """Prepare reusable blend mask material for realtime inference."""
     body = Image.fromarray(image[:,:,::-1])
 
     x, y, x1, y1 = face_box
@@ -133,4 +141,6 @@ def get_image_prepare_material(image, face_box, upper_boundary_ratio=0.5, expand
 
     blur_kernel_size = int(0.1 * ori_shape[0] // 2 * 2) + 1
     mask_array = cv2.GaussianBlur(np.array(modified_mask_image), (blur_kernel_size, blur_kernel_size), 0)
+    face_rect = (x - x_s, y - y_s, x1 - x_s, y1 - y_s)
+    mask_array = apply_side_protect_mask(mask_array, face_rect, side_protect_ratio)
     return mask_array, crop_box

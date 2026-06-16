@@ -26,6 +26,7 @@ import sys
 
 from musetalk.utils.blending import get_image
 from musetalk.utils.face_parsing import FaceParsing
+from musetalk.utils.mask_utils import adjust_face_box
 from musetalk.utils.audio_processor import AudioProcessor
 from musetalk.utils.utils import get_file_type, get_video_fps, datagen, load_all_model
 from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder
@@ -155,10 +156,7 @@ def main(args):
                 raise ValueError(f"Input audio file is empty (0 bytes): {audio_path}")
 
             # Set bbox_shift based on version
-            if args.version == "v15":
-                bbox_shift = 0  # v15 uses fixed bbox_shift
-            else:
-                bbox_shift = inference_config[task_id].get("bbox_shift", args.bbox_shift)  # v1 uses config or default
+            bbox_shift = inference_config[task_id].get("bbox_shift", args.bbox_shift)
             
             # Set output paths
             input_basename = os.path.basename(video_path).split('.')[0]
@@ -252,6 +250,14 @@ def main(args):
                 if bbox != coord_placeholder and (bbox[2]-bbox[0]) > 0 and (bbox[3]-bbox[1]) > 0:
                     x1, y1, x2, y2 = bbox
                     if args.version == "v15":
+                        x1, y1, x2, y2 = adjust_face_box(
+                            bbox,
+                            frame.shape,
+                            bbox_left_ratio=args.bbox_left_ratio,
+                            bbox_right_ratio=args.bbox_right_ratio,
+                            bbox_top_ratio=args.bbox_top_ratio,
+                            bbox_bottom_ratio=args.bbox_bottom_ratio
+                        )
                         y2 = y2 + args.extra_margin
                         y2 = min(y2, frame.shape[0])
                     crop_frame = frame[y1:y2, x1:x2]
@@ -281,6 +287,14 @@ def main(args):
                 
                 x1, y1, x2, y2 = bbox
                 if args.version == "v15":
+                    x1, y1, x2, y2 = adjust_face_box(
+                        bbox,
+                        frame.shape,
+                        bbox_left_ratio=args.bbox_left_ratio,
+                        bbox_right_ratio=args.bbox_right_ratio,
+                        bbox_top_ratio=args.bbox_top_ratio,
+                        bbox_bottom_ratio=args.bbox_bottom_ratio
+                    )
                     y2 = y2 + args.extra_margin
                     y2 = min(y2, frame.shape[0])
                 
@@ -288,7 +302,7 @@ def main(args):
                 try:
                     crop_frame = cv2.resize(crop_frame, (256,256), interpolation=cv2.INTER_LANCZOS4)
                     latents = vae.get_latents_for_unet(crop_frame)
-                    last_valid_bbox = [x1, y1, x2, y2]
+                    last_valid_bbox = bbox
                     last_valid_latents = latents
                     input_latent_list.append(latents)
                 except Exception as e:
@@ -339,8 +353,16 @@ def main(args):
                     continue
                 
                 if args.version == "v15":
+                    x1, y1, x2, y2 = adjust_face_box(
+                        bbox,
+                        ori_frame.shape,
+                        bbox_left_ratio=args.bbox_left_ratio,
+                        bbox_right_ratio=args.bbox_right_ratio,
+                        bbox_top_ratio=args.bbox_top_ratio,
+                        bbox_bottom_ratio=args.bbox_bottom_ratio
+                    )
                     y2 = y2 + args.extra_margin
-                    y2 = min(y2, frame.shape[0])
+                    y2 = min(y2, ori_frame.shape[0])
                 try:
                     res_frame = cv2.resize(res_frame.astype(np.uint8), (x2-x1, y2-y1))
                 except Exception as e:
@@ -350,7 +372,14 @@ def main(args):
                 # Merge results with version-specific parameters
                 try:
                     if args.version == "v15":
-                        combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+                        combine_frame = get_image(
+                            ori_frame,
+                            res_frame,
+                            [x1, y1, x2, y2],
+                            mode=args.parsing_mode,
+                            fp=fp,
+                            side_protect_ratio=args.side_protect_ratio
+                        )
                     else:
                         combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], fp=fp)
                     cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", combine_frame)
@@ -407,6 +436,11 @@ if __name__ == "__main__":
     parser.add_argument("--parsing_mode", default='jaw', help="Face blending parsing mode")
     parser.add_argument("--left_cheek_width", type=int, default=90, help="Width of left cheek region")
     parser.add_argument("--right_cheek_width", type=int, default=90, help="Width of right cheek region")
+    parser.add_argument("--side_protect_ratio", type=float, default=0.08, help="Side-edge blend protection ratio")
+    parser.add_argument("--bbox_left_ratio", type=float, default=0.0, help="Left bbox adjust ratio; positive expands, negative shrinks")
+    parser.add_argument("--bbox_right_ratio", type=float, default=0.0, help="Right bbox adjust ratio; positive expands, negative shrinks")
+    parser.add_argument("--bbox_top_ratio", type=float, default=0.0, help="Top bbox adjust ratio; positive expands, negative shrinks")
+    parser.add_argument("--bbox_bottom_ratio", type=float, default=0.0, help="Bottom bbox adjust ratio; positive expands, negative shrinks")
     parser.add_argument("--bbox_smooth_window", type=int, default=1, help="Centered moving-average window for bbox smoothing; 1 disables smoothing")
     parser.add_argument("--version", type=str, default="v15", choices=["v1", "v15"], help="Model version to use")
     args = parser.parse_args()

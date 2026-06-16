@@ -26,6 +26,7 @@ from musetalk.utils.face_parsing import FaceParsing
 from musetalk.utils.utils import datagen
 from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs
 from musetalk.utils.blending import get_image_prepare_material, get_image_blending
+from musetalk.utils.mask_utils import adjust_face_box
 from musetalk.utils.utils import load_all_model, get_video_fps, get_file_type
 from musetalk.utils.audio_processor import AudioProcessor
 
@@ -183,6 +184,14 @@ class Avatar:
             if bbox != coord_placeholder and (bbox[2]-bbox[0]) > 0 and (bbox[3]-bbox[1]) > 0:
                 x1, y1, x2, y2 = bbox
                 if args.version == "v15":
+                    x1, y1, x2, y2 = adjust_face_box(
+                        bbox,
+                        frame.shape,
+                        bbox_left_ratio=args.bbox_left_ratio - args.bbox_shrink_ratio,
+                        bbox_right_ratio=args.bbox_right_ratio - args.bbox_shrink_ratio,
+                        bbox_top_ratio=args.bbox_top_ratio,
+                        bbox_bottom_ratio=args.bbox_bottom_ratio
+                    )
                     y2 = y2 + args.extra_margin
                     y2 = min(y2, frame.shape[0])
                 crop_frame = frame[y1:y2, x1:x2]
@@ -210,6 +219,14 @@ class Avatar:
             
             x1, y1, x2, y2 = bbox
             if args.version == "v15":
+                x1, y1, x2, y2 = adjust_face_box(
+                    bbox,
+                    frame.shape,
+                    bbox_left_ratio=args.bbox_left_ratio - args.bbox_shrink_ratio,
+                    bbox_right_ratio=args.bbox_right_ratio - args.bbox_shrink_ratio,
+                    bbox_top_ratio=args.bbox_top_ratio,
+                    bbox_bottom_ratio=args.bbox_bottom_ratio
+                )
                 y2 = y2 + args.extra_margin
                 y2 = min(y2, frame.shape[0])
                 coord_list[idx] = [x1, y1, x2, y2]
@@ -240,7 +257,13 @@ class Avatar:
                 mode = args.parsing_mode
             else:
                 mode = "raw"
-            mask, crop_box = get_image_prepare_material(frame, [x1, y1, x2, y2], fp=fp, mode=mode)
+            mask, crop_box = get_image_prepare_material(
+                frame,
+                [x1, y1, x2, y2],
+                fp=fp,
+                mode=mode,
+                side_protect_ratio=args.side_protect_ratio if args.version == "v15" else 0.0
+            )
 
             cv2.imwrite(f"{self.mask_out_path}/{str(i).zfill(8)}.png", mask)
             self.mask_coords_list_cycle += [crop_box]
@@ -398,6 +421,12 @@ if __name__ == "__main__":
     parser.add_argument("--parsing_mode", default='jaw', help="Face blending parsing mode")
     parser.add_argument("--left_cheek_width", type=int, default=90, help="Width of left cheek region")
     parser.add_argument("--right_cheek_width", type=int, default=90, help="Width of right cheek region")
+    parser.add_argument("--side_protect_ratio", type=float, default=0.08, help="Side-edge blend protection ratio")
+    parser.add_argument("--bbox_shrink_ratio", type=float, default=0.0, help="Legacy horizontal bbox shrink ratio")
+    parser.add_argument("--bbox_left_ratio", type=float, default=0.0, help="Left bbox adjust ratio; positive expands, negative shrinks")
+    parser.add_argument("--bbox_right_ratio", type=float, default=0.0, help="Right bbox adjust ratio; positive expands, negative shrinks")
+    parser.add_argument("--bbox_top_ratio", type=float, default=0.0, help="Top bbox adjust ratio; positive expands, negative shrinks")
+    parser.add_argument("--bbox_bottom_ratio", type=float, default=0.0, help="Bottom bbox adjust ratio; positive expands, negative shrinks")
     parser.add_argument("--skip_save_images",
                        action="store_true",
                        help="Whether skip saving images for better generation speed calculation",

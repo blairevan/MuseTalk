@@ -68,12 +68,18 @@ def main():
     parser.add_argument("--face", type=str, required=True, help="Input face video path")
     parser.add_argument("--audio", type=str, required=True, help="Input audio path")
     parser.add_argument("--outfile", type=str, required=True, help="Output video path (must be a specific .mp4 file)")
-    parser.add_argument("--version", type=str, default="v1.5", choices=["v1.0", "v1.5"])
-    parser.add_argument("--extra_margin", type=int, default=10, help="Extra margin for face cropping")
+    parser.add_argument("--model_version", type=str, default="v1.5", choices=["v1.0", "v1.5"])
+    parser.add_argument("--bbox_shift", type=int, default=0, help="Bounding box vertical shift in pixels")
+    parser.add_argument("--extra_margin", type=int, default=8, help="Extra margin for face cropping")
+    parser.add_argument("--bbox_left_ratio", type=float, default=0.0, help="Left bbox adjust ratio; positive expands, negative shrinks")
+    parser.add_argument("--bbox_right_ratio", type=float, default=0.0, help="Right bbox adjust ratio; positive expands, negative shrinks")
+    parser.add_argument("--bbox_top_ratio", type=float, default=0.0, help="Top bbox adjust ratio; positive expands, negative shrinks")
+    parser.add_argument("--bbox_bottom_ratio", type=float, default=0.0, help="Bottom bbox adjust ratio; positive expands, negative shrinks")
     parser.add_argument("--parsing_mode", type=str, default="jaw", choices=["jaw", "raw"], help="Face blending parsing mode")
-    parser.add_argument("--left_cheek_width", type=int, default=90, help="Width of left cheek editing region")
-    parser.add_argument("--right_cheek_width", type=int, default=90, help="Width of right cheek editing region")
-    parser.add_argument("--bbox_smooth_window", type=int, default=1, help="Centered moving-average window for bbox smoothing; 1 disables smoothing")
+    parser.add_argument("--left_cheek_width", type=int, default=120, help="Width of left cheek editing region")
+    parser.add_argument("--right_cheek_width", type=int, default=120, help="Width of right cheek editing region")
+    parser.add_argument("--side_protect_ratio", type=float, default=0.08, help="Side-edge blend protection ratio")
+    parser.add_argument("--bbox_smooth_window", type=int, default=7, help="Centered moving-average window for bbox smoothing; 1 disables smoothing")
     
     args = parser.parse_args()
 
@@ -104,7 +110,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     # 根据选定的版本，自动组装底层的模型路径
-    if args.version == "v1.0":
+    if args.model_version == "v1.0":
         unet_model_path = "./models/musetalk/pytorch_model.bin"
         unet_config = "./models/musetalk/musetalk.json"
         version_arg = "v1"
@@ -122,10 +128,16 @@ def main():
         "--unet_model_path", unet_model_path,
         "--unet_config", unet_config,
         "--version", version_arg,
+        "--bbox_shift", str(args.bbox_shift),
         "--extra_margin", str(args.extra_margin),
+        "--bbox_left_ratio", str(args.bbox_left_ratio),
+        "--bbox_right_ratio", str(args.bbox_right_ratio),
+        "--bbox_top_ratio", str(args.bbox_top_ratio),
+        "--bbox_bottom_ratio", str(args.bbox_bottom_ratio),
         "--parsing_mode", args.parsing_mode,
         "--left_cheek_width", str(args.left_cheek_width),
         "--right_cheek_width", str(args.right_cheek_width),
+        "--side_protect_ratio", str(args.side_protect_ratio),
         "--bbox_smooth_window", str(args.bbox_smooth_window)
     ]
     

@@ -56,7 +56,12 @@ def draw_debug_parameter_overlay(
         extra_margin,
         parsing_mode,
         left_cheek_width,
-        right_cheek_width):
+        right_cheek_width,
+        bbox_left_ratio,
+        bbox_right_ratio,
+        bbox_top_ratio,
+        bbox_bottom_ratio,
+        side_protect_ratio):
     """Draw visual guides for the main inpainting debug parameters."""
     image = draw_dashed_rectangle(image, face_box[:2], face_box[2:])
     x1, y1, x2, y2 = face_box
@@ -97,11 +102,16 @@ def draw_debug_parameter_overlay(
 
     left_boundary = int(np.clip(center_x - left_cheek_width * width / 512, x1, x2))
     right_boundary = int(np.clip(center_x + right_cheek_width * width / 512, x1, x2))
+    side_protect_width = int(round(width * side_protect_ratio))
+    side_protect_width = int(np.clip(side_protect_width, 0, width // 2))
     cv2.line(image, (left_boundary, y1), (left_boundary, y2), (255, 128, 0), 2)
     cv2.line(image, (right_boundary, y1), (right_boundary, y2), (255, 128, 0), 2)
+    if side_protect_width > 0:
+        cv2.line(image, (x1 + side_protect_width, y1), (x1 + side_protect_width, y2), (0, 255, 0), 2)
+        cv2.line(image, (x2 - side_protect_width, y1), (x2 - side_protect_width, y2), (0, 255, 0), 2)
     cv2.putText(
         image,
-        f"L={left_cheek_width} R={right_cheek_width}",
+        f"L={left_cheek_width} R={right_cheek_width} box={bbox_left_ratio:.2f}/{bbox_right_ratio:.2f}/{bbox_top_ratio:.2f}/{bbox_bottom_ratio:.2f} side={side_protect_ratio:.2f}",
         (label_x, min(y2 + 24, image.shape[0] - 8)),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.5,
@@ -158,7 +168,9 @@ def smooth_bbox_sequence(coord_list, window_size):
 @torch.no_grad()
 def debug_inpainting(video_path, version, bbox_shift, extra_margin=8, parsing_mode="jaw",
                     left_cheek_width=120, right_cheek_width=120, bbox_smooth_window=7,
-                    show_face_coordinates=False):
+                    show_face_coordinates=False, side_protect_ratio=0.08,
+                    bbox_left_ratio=0.0, bbox_right_ratio=0.0,
+                    bbox_top_ratio=0.0, bbox_bottom_ratio=0.0):
     """Debug inpainting parameters, only process the first frame"""
     # Set default parameters
     args_dict = {
@@ -173,7 +185,12 @@ def debug_inpainting(video_path, version, bbox_shift, extra_margin=8, parsing_mo
         "extra_margin": extra_margin,
         "parsing_mode": parsing_mode,
         "left_cheek_width": left_cheek_width,
-        "right_cheek_width": right_cheek_width
+        "right_cheek_width": right_cheek_width,
+        "side_protect_ratio": side_protect_ratio,
+        "bbox_left_ratio": bbox_left_ratio,
+        "bbox_right_ratio": bbox_right_ratio,
+        "bbox_top_ratio": bbox_top_ratio,
+        "bbox_bottom_ratio": bbox_bottom_ratio
     }
     args = Namespace(**args_dict)
 
@@ -208,7 +225,14 @@ def debug_inpainting(video_path, version, bbox_shift, extra_margin=8, parsing_mo
     )
     
     # Process first frame
-    x1, y1, x2, y2 = bbox
+    x1, y1, x2, y2 = adjust_face_box(
+        bbox,
+        frame.shape,
+        bbox_left_ratio=args.bbox_left_ratio,
+        bbox_right_ratio=args.bbox_right_ratio,
+        bbox_top_ratio=args.bbox_top_ratio,
+        bbox_bottom_ratio=args.bbox_bottom_ratio
+    )
     original_y2 = y2
     y2 = y2 + args.extra_margin
     y2 = min(y2, frame.shape[0])
@@ -230,7 +254,14 @@ def debug_inpainting(video_path, version, bbox_shift, extra_margin=8, parsing_mo
     # Inpaint back to original image
     res_frame = recon[0]
     res_frame = cv2.resize(res_frame.astype(np.uint8),(x2-x1,y2-y1))
-    combine_frame = get_image(frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+    combine_frame = get_image(
+        frame,
+        res_frame,
+        [x1, y1, x2, y2],
+        mode=args.parsing_mode,
+        fp=fp,
+        side_protect_ratio=args.side_protect_ratio
+    )
 
     if show_face_coordinates:
         combine_frame = draw_debug_parameter_overlay(
@@ -241,7 +272,12 @@ def debug_inpainting(video_path, version, bbox_shift, extra_margin=8, parsing_mo
             extra_margin,
             parsing_mode,
             left_cheek_width,
-            right_cheek_width
+            right_cheek_width,
+            bbox_left_ratio,
+            bbox_right_ratio,
+            bbox_top_ratio,
+            bbox_bottom_ratio,
+            side_protect_ratio
         )
     
     # Save results (no need to convert color space again since get_image already returns RGB format)
@@ -256,6 +292,11 @@ def debug_inpainting(video_path, version, bbox_shift, extra_margin=8, parsing_mo
                 f"parsing_mode: {parsing_mode}\n" + \
                 f"left_cheek_width: {left_cheek_width}\n" + \
                 f"right_cheek_width: {right_cheek_width}\n" + \
+                f"bbox_left_ratio: {bbox_left_ratio}\n" + \
+                f"bbox_right_ratio: {bbox_right_ratio}\n" + \
+                f"bbox_top_ratio: {bbox_top_ratio}\n" + \
+                f"bbox_bottom_ratio: {bbox_bottom_ratio}\n" + \
+                f"side_protect_ratio: {side_protect_ratio}\n" + \
                 f"bbox_smooth_window: {bbox_smooth_window}\n" + \
                 f"Detected face coordinates: [{x1}, {y1}, {x2}, {y2}]"
     
@@ -306,6 +347,7 @@ download_model()  # for huggingface deployment.
 
 from musetalk.utils.blending import get_image
 from musetalk.utils.face_parsing import FaceParsing
+from musetalk.utils.mask_utils import adjust_face_box
 from musetalk.utils.audio_processor import AudioProcessor
 import torch
 
@@ -333,6 +375,8 @@ def fast_check_ffmpeg():
 @torch.no_grad()
 def inference(audio_path, video_path, version, bbox_shift, extra_margin=8, parsing_mode="jaw",
               left_cheek_width=120, right_cheek_width=120, bbox_smooth_window=7,
+              side_protect_ratio=0.08, bbox_left_ratio=0.0, bbox_right_ratio=0.0,
+              bbox_top_ratio=0.0, bbox_bottom_ratio=0.0,
               progress=gr.Progress(track_tqdm=True)):
     # Set default parameters, aligned with inference.py
     args_dict = {
@@ -348,7 +392,12 @@ def inference(audio_path, video_path, version, bbox_shift, extra_margin=8, parsi
         "parsing_mode": parsing_mode,
         "left_cheek_width": left_cheek_width,
         "right_cheek_width": right_cheek_width,
-        "bbox_smooth_window": bbox_smooth_window
+        "bbox_smooth_window": bbox_smooth_window,
+        "side_protect_ratio": side_protect_ratio,
+        "bbox_left_ratio": bbox_left_ratio,
+        "bbox_right_ratio": bbox_right_ratio,
+        "bbox_top_ratio": bbox_top_ratio,
+        "bbox_bottom_ratio": bbox_bottom_ratio
     }
     args = Namespace(**args_dict)
 
@@ -432,7 +481,14 @@ def inference(audio_path, video_path, version, bbox_shift, extra_margin=8, parsi
     for bbox, frame in zip(coord_list, frame_list):
         if bbox == coord_placeholder:
             continue
-        x1, y1, x2, y2 = bbox
+        x1, y1, x2, y2 = adjust_face_box(
+            bbox,
+            frame.shape,
+            bbox_left_ratio=args.bbox_left_ratio,
+            bbox_right_ratio=args.bbox_right_ratio,
+            bbox_top_ratio=args.bbox_top_ratio,
+            bbox_bottom_ratio=args.bbox_bottom_ratio
+        )
         y2 = y2 + args.extra_margin
         y2 = min(y2, frame.shape[0])
         crop_frame = frame[y1:y2, x1:x2]
@@ -472,16 +528,30 @@ def inference(audio_path, video_path, version, bbox_shift, extra_margin=8, parsi
     for i, res_frame in enumerate(tqdm(res_frame_list)):
         bbox = coord_list_cycle[i%(len(coord_list_cycle))]
         ori_frame = copy.deepcopy(frame_list_cycle[i%(len(frame_list_cycle))])
-        x1, y1, x2, y2 = bbox
+        x1, y1, x2, y2 = adjust_face_box(
+            bbox,
+            ori_frame.shape,
+            bbox_left_ratio=args.bbox_left_ratio,
+            bbox_right_ratio=args.bbox_right_ratio,
+            bbox_top_ratio=args.bbox_top_ratio,
+            bbox_bottom_ratio=args.bbox_bottom_ratio
+        )
         y2 = y2 + args.extra_margin
-        y2 = min(y2, frame.shape[0])
+        y2 = min(y2, ori_frame.shape[0])
         try:
             res_frame = cv2.resize(res_frame.astype(np.uint8),(x2-x1,y2-y1))
         except:
             continue
         
         # Use v15 version blending
-        combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], mode=args.parsing_mode, fp=fp)
+        combine_frame = get_image(
+            ori_frame,
+            res_frame,
+            [x1, y1, x2, y2],
+            mode=args.parsing_mode,
+            fp=fp,
+            side_protect_ratio=args.side_protect_ratio
+        )
             
         cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png",combine_frame)
         
@@ -650,11 +720,16 @@ with gr.Blocks(css=css) as demo:
     with gr.Row():
         version = gr.Radio(label="Version", choices=["v1.5"], value="v1.5")
         bbox_shift = gr.Number(label="BBox_shift value, px", value=0)
+        bbox_left_ratio = gr.Slider(label="BBox Left Adjust Ratio", minimum=-0.2, maximum=0.2, value=0.0, step=0.01)
+        bbox_right_ratio = gr.Slider(label="BBox Right Adjust Ratio", minimum=-0.2, maximum=0.2, value=0.0, step=0.01)
+        bbox_top_ratio = gr.Slider(label="BBox Top Adjust Ratio", minimum=-0.2, maximum=0.2, value=0.0, step=0.01)
+        bbox_bottom_ratio = gr.Slider(label="BBox Bottom Adjust Ratio", minimum=-0.2, maximum=0.2, value=0.0, step=0.01)
         extra_margin = gr.Slider(label="Extra Margin", minimum=0, maximum=40, value=8, step=1)
         parsing_mode = gr.Radio(label="Parsing Mode", choices=["jaw", "raw"], value="jaw")
         left_cheek_width = gr.Slider(label="Left Cheek Width", minimum=20, maximum=160, value=120, step=5)
         right_cheek_width = gr.Slider(label="Right Cheek Width", minimum=20, maximum=160, value=120, step=5)
         bbox_smooth_window = gr.Slider(label="BBox Smooth Window", minimum=1, maximum=15, value=7, step=2)
+        side_protect_ratio = gr.Slider(label="Side Protect Ratio", minimum=0.0, maximum=0.2, value=0.08, step=0.01)
         show_face_coordinates = gr.Checkbox(label="Show Detected Face Coordinates", value=True)
 
     bbox_shift_scale = gr.Markdown(visible=False)
@@ -678,23 +753,26 @@ with gr.Blocks(css=css) as demo:
 ### 参数说明
 
 - **BBox_shift value, px**：控制检测到的人脸框整体在垂直方向上的偏移。正值通常让编辑区域向下移动，嘴部张开效果可能更明显；负值通常让编辑区域向上移动，嘴部变化会更收敛。建议先点击 `1. Test Inpainting` 查看可调范围，再在范围内微调。
+- **BBox Left/Right/Top/Bottom Adjust Ratio**：分别控制红色检测框四条边。正数表示向外扩大，负数表示向内缩小；例如左耳贴近红框时把 `BBox Left Adjust Ratio` 调到 `-0.04` 或 `-0.06`，下巴区域不足时把 `BBox Bottom Adjust Ratio` 调到 `0.04`。
 - **Version**：当前页面加载的是 MuseTalk `v1.5` 权重，因此页面版本固定为 `v1.5`。
 - **Extra Margin**：在人脸框底部额外向下扩展的像素范围，主要影响下巴和 jaw 区域的融合空间。数值过小可能导致下巴附近融合不足，数值过大可能影响到脖子或衣领区域。
 - **Parsing Mode**：控制融合 mask 的构建方式。`jaw` 会更关注下颌和脸颊边界，通常适合真人视频；`raw` 更接近原始解析区域，适合在 `jaw` 出现边缘异常时对比排查。
 - **Left Cheek Width**：在 `jaw` 模式下控制左脸颊侧的编辑保护范围。数值越大，左侧脸颊参与编辑的范围越收敛；数值越小，左侧脸颊更容易被融合区域影响。
 - **Right Cheek Width**：在 `jaw` 模式下控制右脸颊侧的编辑保护范围。数值越大，右侧脸颊参与编辑的范围越收敛；数值越小，右侧脸颊更容易被融合区域影响。
 - **BBox Smooth Window**：对完整视频生成时的人脸框序列做居中滑动平滑，`1` 表示关闭。数值越大，框抖动越少，但过大可能让快速头部运动跟随变慢；常用值为 `5` 或 `7`。
-- **Show Detected Face Coordinates**：开启后，`1. Test Inpainting` 的预览图会叠加调试标注。红色虚线框表示最终检测框，黄色标注表示 `Extra Margin`，紫色箭头表示 `BBox_shift`，橙色竖线表示左右脸颊宽度的近似影响边界。
+- **Side Protect Ratio**：降低人脸框左右边缘的融合强度，用于保护耳朵和头发边界。耳朵有拼接线时建议从 `0.08` 调到 `0.10` 或 `0.12`；如果嘴角或脸颊变化被压得太小，再降到 `0.04` 到 `0.06`。
+- **Show Detected Face Coordinates**：开启后，`1. Test Inpainting` 的预览图会叠加调试标注。红色虚线框表示最终检测框，黄色标注表示 `Extra Margin`，紫色箭头表示 `BBox_shift`，橙色竖线表示左右脸颊宽度的近似影响边界，绿色竖线表示 `Side Protect Ratio` 的左右保护边界。
 
-建议调参顺序：先调 `BBox_shift value, px`，再调 `Extra Margin`，然后只在脸颊边缘异常时调整 `Left Cheek Width` 和 `Right Cheek Width`，最后根据视频抖动情况调整 `BBox Smooth Window`。
+建议调参顺序：先调 `BBox_shift value, px`，耳朵贴近红框时调对应侧的 `BBox Adjust Ratio` 为负数，再调 `Extra Margin`，然后只在脸颊边缘异常时调整 `Left Cheek Width` 和 `Right Cheek Width`，耳朵或头发边缘仍有拼接线时调整 `Side Protect Ratio`，最后根据视频抖动情况调整 `BBox Smooth Window`。
 
 ### 推荐参数
 
-- **通用起始值**：`Version = v1.5`，`BBox_shift value, px = 0`，`Extra Margin = 8`，`Parsing Mode = jaw`，`Left Cheek Width = 120`，`Right Cheek Width = 120`，`BBox Smooth Window = 7`。
+- **通用起始值**：`Version = v1.5`，`BBox_shift value, px = 0`，四个 `BBox Adjust Ratio = 0`，`Extra Margin = 8`，`Parsing Mode = jaw`，`Left Cheek Width = 120`，`Right Cheek Width = 120`，`BBox Smooth Window = 7`，`Side Protect Ratio = 0.08`。
 - **嘴型张开不够**：优先把 `BBox_shift value, px` 往正数方向微调，例如 `3` 到 `8`；如果下巴融合空间不足，再把 `Extra Margin` 调到 `12` 到 `18`。
 - **嘴型变化过大或下巴变形**：优先把 `BBox_shift value, px` 往负数方向微调，例如 `-3` 到 `-8`；必要时降低 `Extra Margin`。
 - **脸颊边缘被明显改动**：在 `jaw` 模式下增大对应侧的 cheek width，例如把 `Left Cheek Width` 或 `Right Cheek Width` 从 `90` 调到 `110` 到 `130`。
 - **融合边缘不自然**：先保持 `Parsing Mode = jaw`，微调 `Extra Margin`；如果 jaw 模式边界异常明显，再切换到 `raw` 对比效果。
+- **耳朵或头发边缘有拼接线**：保持 `Parsing Mode = jaw`，优先把对应侧的 `BBox Adjust Ratio` 调到 `-0.04` 或 `-0.06`；如果仍有线，再把 `Side Protect Ratio` 调到 `0.10` 或 `0.12`。
 
 ### 常见问题：两边嘴角有黑点
 
@@ -728,7 +806,12 @@ with gr.Blocks(css=css) as demo:
             parsing_mode,
             left_cheek_width,
             right_cheek_width,
-            bbox_smooth_window
+            bbox_smooth_window,
+            side_protect_ratio,
+            bbox_left_ratio,
+            bbox_right_ratio,
+            bbox_top_ratio,
+            bbox_bottom_ratio
         ],
         outputs=[out1,bbox_shift_scale]
     ).then(
@@ -747,7 +830,12 @@ with gr.Blocks(css=css) as demo:
             left_cheek_width,
             right_cheek_width,
             bbox_smooth_window,
-            show_face_coordinates
+            show_face_coordinates,
+            side_protect_ratio,
+            bbox_left_ratio,
+            bbox_right_ratio,
+            bbox_top_ratio,
+            bbox_bottom_ratio
         ],
         outputs=[debug_image, debug_info]
     )
