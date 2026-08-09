@@ -242,10 +242,11 @@ class Avatar:
                 coord_list[idx] = last_valid_bbox
                 input_latent_list.append(last_valid_latents)
 
-        # Pure forward loop (Loop Mode) instead of double-sided Mirror Cycle, eliminating muscle reverse tear
-        self.frame_list_cycle = frame_list
-        self.coord_list_cycle = coord_list
-        self.input_latent_list_cycle = input_latent_list
+        # Ping-Pong mirror cycle to eliminate seam at loop boundary
+        # Original: [0, 1, ..., N-1] → Extended: [0, 1, ..., N-1, N-2, ..., 1]
+        self.frame_list_cycle = frame_list + frame_list[-2::-1] if len(frame_list) > 1 else frame_list
+        self.coord_list_cycle = coord_list + coord_list[-2::-1] if len(coord_list) > 1 else coord_list
+        self.input_latent_list_cycle = input_latent_list + input_latent_list[-2::-1] if len(input_latent_list) > 1 else input_latent_list
         self.mask_coords_list_cycle = []
         self.mask_list_cycle = []
 

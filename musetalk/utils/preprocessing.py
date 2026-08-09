@@ -12,18 +12,38 @@ from mmpose.structures import merge_data_samples
 import torch
 from tqdm import tqdm
 
-# initialize the mmpose model
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 config_file = './musetalk/utils/dwpose/rtmpose-l_8xb32-270e_coco-ubody-wholebody-384x288.py'
 checkpoint_file = './models/dwpose/dw-ll_ucoco_384.pth'
-model = init_model(config_file, checkpoint_file, device=device)
-
-# initialize the face detection model
-device = "cuda" if torch.cuda.is_available() else "cpu"
-fa = FaceAlignment(LandmarksType._2D, flip_input=False,device=device)
+LANDMARK_CACHE_CLEAR_INTERVAL = 50
+model = None
+fa = None
 
 # maker if the bbox is not sufficient 
 coord_placeholder = (0.0,0.0,0.0,0.0)
+
+def get_landmark_models():
+    """Load and return DWPose and face detection models only when needed."""
+    global model, fa
+    if model is None:
+        pose_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = init_model(config_file, checkpoint_file, device=pose_device)
+    if fa is None:
+        face_device = "cuda" if torch.cuda.is_available() else "cpu"
+        fa = FaceAlignment(LandmarksType._2D, flip_input=False,device=face_device)
+    return model, fa
+
+def release_landmark_models():
+    """Release landmark and face detection models to lower GPU memory usage."""
+    global model, fa
+    model = None
+    fa = None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+def clear_cuda_cache_periodically(processed_count):
+    """Clear cached CUDA memory after fixed-size landmark processing chunks."""
+    if torch.cuda.is_available() and processed_count % LANDMARK_CACHE_CLEAR_INTERVAL == 0:
+        torch.cuda.empty_cache()
 
 def resize_landmark(landmark, w, h, new_w, new_h):
     w_ratio = new_w / w
@@ -42,6 +62,7 @@ def read_imgs(img_list):
 
 def get_bbox_range(img_list,upperbondrange =0):
     frames = read_imgs(img_list)
+    pose_model, face_alignment = get_landmark_models()
     batch_size_fa = 1
     batches = [frames[i:i + batch_size_fa] for i in range(0, len(frames), batch_size_fa)]
     coords_list = []
@@ -52,15 +73,15 @@ def get_bbox_range(img_list,upperbondrange =0):
         print('get key_landmark and face bounding boxes with the default value')
     average_range_minus = []
     average_range_plus = []
-    for fb in tqdm(batches):
-        results = inference_topdown(model, np.asarray(fb)[0])
+    for batch_index, fb in enumerate(tqdm(batches), start=1):
+        results = inference_topdown(pose_model, np.asarray(fb)[0])
         results = merge_data_samples(results)
         keypoints = results.pred_instances.keypoints
         face_land_mark= keypoints[0][23:91]
         face_land_mark = face_land_mark.astype(np.int32)
         
         # get bounding boxes by face detetion
-        bbox = fa.get_detections_for_batch(np.asarray(fb))
+        bbox = face_alignment.get_detections_for_batch(np.asarray(fb))
         
         # adjust the bounding box refer to landmark
         # Add the bounding box to a tuple and append it to the coordinates list
@@ -76,6 +97,7 @@ def get_bbox_range(img_list,upperbondrange =0):
             average_range_plus.append(range_plus)
             if upperbondrange != 0:
                 half_face_coord[1] = upperbondrange+half_face_coord[1] #手动调整  + 向下（偏29）  - 向上（偏28）
+        clear_cuda_cache_periodically(batch_index)
 
     text_range=f"Total frame:「{len(frames)}」 Manually adjust range : [ -{int(sum(average_range_minus) / len(average_range_minus))}~{int(sum(average_range_plus) / len(average_range_plus))} ] , the current value: {upperbondrange}"
     return text_range
@@ -83,8 +105,8 @@ def get_bbox_range(img_list,upperbondrange =0):
 
 def get_landmark_and_bbox(img_list,upperbondrange =0):
     frames = read_imgs(img_list)
+    pose_model, face_alignment = get_landmark_models()
     batch_size_fa = 1
-    batches = [frames[i:i + batch_size_fa] for i in range(0, len(frames), batch_size_fa)]
     coords_list = []
     landmarks = []
     if upperbondrange != 0:
@@ -93,15 +115,16 @@ def get_landmark_and_bbox(img_list,upperbondrange =0):
         print('get key_landmark and face bounding boxes with the default value')
     average_range_minus = []
     average_range_plus = []
-    for fb in tqdm(batches):
-        results = inference_topdown(model, np.asarray(fb)[0])
+    for batch_start in tqdm(range(0, len(frames), batch_size_fa)):
+        fb = frames[batch_start:batch_start + batch_size_fa]
+        results = inference_topdown(pose_model, np.asarray(fb)[0])
         results = merge_data_samples(results)
         keypoints = results.pred_instances.keypoints
         face_land_mark= keypoints[0][23:91]
         face_land_mark = face_land_mark.astype(np.int32)
         
         # get bounding boxes by face detetion
-        bbox = fa.get_detections_for_batch(np.asarray(fb))
+        bbox = face_alignment.get_detections_for_batch(np.asarray(fb))
         
         # adjust the bounding box refer to landmark
         # Add the bounding box to a tuple and append it to the coordinates list
@@ -130,6 +153,7 @@ def get_landmark_and_bbox(img_list,upperbondrange =0):
                 print("error bbox:",f)
             else:
                 coords_list += [f_landmark]
+        clear_cuda_cache_periodically(batch_start + len(fb))
     
     print("********************************************bbox_shift parameter adjustment**********************************************************")
     print(f"Total frame:「{len(frames)}」 Manually adjust range : [ -{int(sum(average_range_minus) / len(average_range_minus))}~{int(sum(average_range_plus) / len(average_range_plus))} ] , the current value: {upperbondrange}")

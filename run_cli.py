@@ -4,6 +4,8 @@ import sys
 import yaml
 import subprocess
 
+from musetalk.utils.audio_utils import parse_bool
+
 def validate_inputs(face_path, audio_path):
     # Check if face_path exists and is non-empty
     if not os.path.exists(face_path):
@@ -80,6 +82,10 @@ def main():
     parser.add_argument("--right_cheek_width", type=int, default=120, help="Width of right cheek editing region")
     parser.add_argument("--side_protect_ratio", type=float, default=0.08, help="Side-edge blend protection ratio")
     parser.add_argument("--bbox_smooth_window", type=int, default=7, help="Centered moving-average window for bbox smoothing; 1 disables smoothing")
+    parser.add_argument("--close_mouth_start", type=parse_bool, default=True, help="Close mouth during leading silence (true/false)")
+    parser.add_argument("--close_mouth_end", type=parse_bool, default=False, help="Close mouth during trailing silence (true/false)")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for inference")
+    parser.add_argument("--use_float16", action="store_true", help="Use float16 for lower GPU memory usage")
     
     args = parser.parse_args()
 
@@ -138,8 +144,13 @@ def main():
         "--left_cheek_width", str(args.left_cheek_width),
         "--right_cheek_width", str(args.right_cheek_width),
         "--side_protect_ratio", str(args.side_protect_ratio),
-        "--bbox_smooth_window", str(args.bbox_smooth_window)
+        "--bbox_smooth_window", str(args.bbox_smooth_window),
+        "--close_mouth_start", str(args.close_mouth_start).lower(),
+        "--close_mouth_end", str(args.close_mouth_end).lower(),
+        "--batch_size", str(args.batch_size)
     ]
+    if args.use_float16:
+        cmd.append("--use_float16")
     
     print(f"🚀 开始执行数字人合成任务...\n底层调用命令: {' '.join(cmd)}\n")
     

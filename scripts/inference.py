@@ -1,6 +1,5 @@
 import os
 import cv2
-import math
 import copy
 import torch
 
@@ -28,8 +27,9 @@ from musetalk.utils.blending import get_image
 from musetalk.utils.face_parsing import FaceParsing
 from musetalk.utils.mask_utils import adjust_face_box
 from musetalk.utils.audio_processor import AudioProcessor
+from musetalk.utils.audio_utils import get_active_audio_frame_range, parse_bool
 from musetalk.utils.utils import get_file_type, get_video_fps, datagen, load_all_model
-from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder
+from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder, release_landmark_models
 
 def smooth_bbox_sequence(coord_list, window_size):
     """Smooth valid face bounding boxes while stabilizing crop scale over time."""
@@ -95,41 +95,6 @@ def main(args):
     
     # Set computing device
     device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
-    # Load model weights
-    vae, unet, pe = load_all_model(
-        unet_model_path=args.unet_model_path, 
-        vae_type=args.vae_type,
-        unet_config=args.unet_config,
-        device=device
-    )
-    timesteps = torch.tensor([0], device=device)
-
-    # Convert models to half precision if float16 is enabled
-    if args.use_float16:
-        pe = pe.half()
-        vae.vae = vae.vae.half()
-        unet.model = unet.model.half()
-    
-    # Move models to specified device
-    pe = pe.to(device)
-    vae.vae = vae.vae.to(device)
-    unet.model = unet.model.to(device)
-        
-    # Initialize audio processor and Whisper model
-    audio_processor = AudioProcessor(feature_extractor_path=args.whisper_dir)
-    weight_dtype = unet.model.dtype
-    whisper = WhisperModel.from_pretrained(args.whisper_dir)
-    whisper = whisper.to(device=device, dtype=weight_dtype).eval()
-    whisper.requires_grad_(False)
-    
-    # Initialize face parser with configurable parameters based on version
-    if args.version == "v15":
-        fp = FaceParsing(
-            left_cheek_width=args.left_cheek_width,
-            right_cheek_width=args.right_cheek_width
-        )
-    else:  # v1
-        fp = FaceParsing()
     
     # Load inference configuration
     inference_config = OmegaConf.load(args.inference_config)
@@ -205,33 +170,73 @@ def main(args):
             else:
                 raise ValueError(f"{video_path} should be a video file, an image file or a directory of images")
 
-            # Extract audio features
+            # Preprocess input images
+            try:
+                if os.path.exists(crop_coord_save_path) and args.use_saved_coord:
+                    print("Using saved coordinates")
+                    with open(crop_coord_save_path, 'rb') as f:
+                        coord_list = pickle.load(f)
+                    frame_list = read_imgs(input_img_list)
+                else:
+                    print("Extracting landmarks... time-consuming operation")
+                    coord_list, frame_list = get_landmark_and_bbox(input_img_list, bbox_shift)
+                    with open(crop_coord_save_path, 'wb') as f:
+                        pickle.dump(coord_list, f)
+            finally:
+                release_landmark_models()
+
+            # Load generation models after landmark detection to avoid GPU memory overlap.
+            vae, unet, pe = load_all_model(
+                unet_model_path=args.unet_model_path,
+                vae_type=args.vae_type,
+                unet_config=args.unet_config,
+                device=device
+            )
+            timesteps = torch.tensor([0], device=device)
+
+            if args.use_float16:
+                pe = pe.half()
+                vae.vae = vae.vae.half()
+                unet.model = unet.model.half()
+
+            pe = pe.to(device)
+            vae.vae = vae.vae.to(device)
+            unet.model = unet.model.to(device)
+            weight_dtype = unet.model.dtype
+
+            audio_processor = AudioProcessor(feature_extractor_path=args.whisper_dir)
+            whisper = WhisperModel.from_pretrained(args.whisper_dir)
+            whisper = whisper.to(device=device, dtype=weight_dtype).eval()
+            whisper.requires_grad_(False)
+
             whisper_input_features, librosa_length = audio_processor.get_audio_feature(audio_path)
             if whisper_input_features is None:
                 raise ValueError(f"Failed to process audio or extract features from {audio_path}")
             whisper_chunks = audio_processor.get_whisper_chunk(
-                whisper_input_features, 
-                device, 
-                weight_dtype, 
-                whisper, 
+                whisper_input_features,
+                device,
+                weight_dtype,
+                whisper,
                 librosa_length,
                 fps=fps,
                 audio_padding_length_left=args.audio_padding_length_left,
                 audio_padding_length_right=args.audio_padding_length_right,
             )
-            
-            # Preprocess input images
-            if os.path.exists(crop_coord_save_path) and args.use_saved_coord:
-                print("Using saved coordinates")
-                with open(crop_coord_save_path, 'rb') as f:
-                    coord_list = pickle.load(f)
-                frame_list = read_imgs(input_img_list)
-            else:
-                print("Extracting landmarks... time-consuming operation")
-                coord_list, frame_list = get_landmark_and_bbox(input_img_list, bbox_shift)
-                with open(crop_coord_save_path, 'wb') as f:
-                    pickle.dump(coord_list, f)
-            
+            active_audio_start_frame, active_audio_end_frame = get_active_audio_frame_range(
+                audio_path,
+                fps
+            )
+            active_audio_start_frame = min(active_audio_start_frame, len(whisper_chunks))
+            active_audio_end_frame = min(active_audio_end_frame, len(whisper_chunks))
+            print(
+                f"Active audio spans frames {active_audio_start_frame}:"
+                f"{active_audio_end_frame}/{len(whisper_chunks)}; leading and trailing "
+                "silence will use the neutral mouth"
+            )
+            del whisper
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             if args.bbox_smooth_window > 1:
                 print(f"Smoothing bbox coordinates with window size: {args.bbox_smooth_window}")
                 coord_list = smooth_bbox_sequence(coord_list, args.bbox_smooth_window)
@@ -310,10 +315,13 @@ def main(args):
                     coord_list[idx] = last_valid_bbox
                     input_latent_list.append(last_valid_latents)
         
-            # Pure forward loop (Loop Mode) instead of double-sided Mirror Cycle, eliminating muscle reverse tear
-            frame_list_cycle = frame_list
-            coord_list_cycle = coord_list
-            input_latent_list_cycle = input_latent_list
+            # Ping-Pong mirror cycle to eliminate seam at loop boundary
+            # Original: [0, 1, ..., N-1] → Extended: [0, 1, ..., N-1, N-2, ..., 1]
+            frame_list_cycle = frame_list + frame_list[-2::-1] if len(frame_list) > 1 else frame_list
+            coord_list_cycle = coord_list + coord_list[-2::-1] if len(coord_list) > 1 else coord_list
+            input_latent_list_cycle = input_latent_list + input_latent_list[-2::-1] if len(input_latent_list) > 1 else input_latent_list
+
+            print(f"Frame cycle length: {len(frame_list)} → {len(frame_list_cycle)} (ping-pong)")
             
             # Batch inference
             print("Starting inference")
@@ -340,8 +348,37 @@ def main(args):
                 for res_frame in recon:
                     res_frame_list.append(res_frame)
             
+            if args.version == "v15":
+                fp = FaceParsing(
+                    left_cheek_width=args.left_cheek_width,
+                    right_cheek_width=args.right_cheek_width
+                )
+            else:
+                fp = FaceParsing()
+
             # Pad generated images to original video size
             print("Padding generated images to original video size")
+            neutral_frame = copy.deepcopy(frame_list[0])
+            neutral_bbox = coord_list[0]
+            neutral_face = None
+            if (
+                neutral_bbox != coord_placeholder
+                and (neutral_bbox[2] - neutral_bbox[0]) > 0
+                and (neutral_bbox[3] - neutral_bbox[1]) > 0
+            ):
+                neutral_x1, neutral_y1, neutral_x2, neutral_y2 = neutral_bbox
+                if args.version == "v15":
+                    neutral_x1, neutral_y1, neutral_x2, neutral_y2 = adjust_face_box(
+                        neutral_bbox,
+                        neutral_frame.shape,
+                        bbox_left_ratio=args.bbox_left_ratio,
+                        bbox_right_ratio=args.bbox_right_ratio,
+                        bbox_top_ratio=args.bbox_top_ratio,
+                        bbox_bottom_ratio=args.bbox_bottom_ratio
+                    )
+                    neutral_y2 = min(neutral_y2 + args.extra_margin, neutral_frame.shape[0])
+                neutral_face = neutral_frame[neutral_y1:neutral_y2, neutral_x1:neutral_x2]
+
             for i, res_frame in enumerate(tqdm(res_frame_list)):
                 bbox = coord_list_cycle[i%(len(coord_list_cycle))]
                 ori_frame = copy.deepcopy(frame_list_cycle[i%(len(frame_list_cycle))])
@@ -363,6 +400,42 @@ def main(args):
                     )
                     y2 = y2 + args.extra_margin
                     y2 = min(y2, ori_frame.shape[0])
+
+                should_close_mouth = (
+                    (i < active_audio_start_frame and args.close_mouth_start)
+                    or (i >= active_audio_end_frame and args.close_mouth_end)
+                )
+                if should_close_mouth:
+                    try:
+                        if neutral_face is None or neutral_face.size == 0:
+                            raise ValueError("Neutral reference face is unavailable")
+                        closed_face = cv2.resize(
+                            neutral_face,
+                            (x2 - x1, y2 - y1),
+                            interpolation=cv2.INTER_LANCZOS4
+                        )
+                        if args.version == "v15":
+                            combine_frame = get_image(
+                                ori_frame,
+                                closed_face,
+                                [x1, y1, x2, y2],
+                                mode=args.parsing_mode,
+                                fp=fp,
+                                side_protect_ratio=args.side_protect_ratio
+                            )
+                        else:
+                            combine_frame = get_image(
+                                ori_frame,
+                                closed_face,
+                                [x1, y1, x2, y2],
+                                fp=fp
+                            )
+                        cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", combine_frame)
+                    except Exception as e:
+                        print(f"Warning: failed to blend neutral mouth at frame {i}: {e}")
+                        cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", ori_frame)
+                    continue
+
                 try:
                     res_frame = cv2.resize(res_frame.astype(np.uint8), (x2-x1, y2-y1))
                 except Exception as e:
@@ -442,6 +515,8 @@ if __name__ == "__main__":
     parser.add_argument("--bbox_top_ratio", type=float, default=0.0, help="Top bbox adjust ratio; positive expands, negative shrinks")
     parser.add_argument("--bbox_bottom_ratio", type=float, default=0.0, help="Bottom bbox adjust ratio; positive expands, negative shrinks")
     parser.add_argument("--bbox_smooth_window", type=int, default=1, help="Centered moving-average window for bbox smoothing; 1 disables smoothing")
+    parser.add_argument("--close_mouth_start", type=parse_bool, default=True, help="Close mouth during leading silence (true/false)")
+    parser.add_argument("--close_mouth_end", type=parse_bool, default=False, help="Close mouth during trailing silence (true/false)")
     parser.add_argument("--version", type=str, default="v15", choices=["v1", "v15"], help="Model version to use")
     args = parser.parse_args()
     main(args)
