@@ -1,6 +1,14 @@
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
-from musetalk.utils.audio_utils import audio_samples_to_frame_range, parse_bool
+import numpy as np
+
+from musetalk.utils.audio_utils import (
+    audio_samples_to_frame_range,
+    get_active_audio_frame_range,
+    parse_bool,
+)
 
 
 class ActiveAudioFrameRangeTest(unittest.TestCase):
@@ -16,6 +24,20 @@ class ActiveAudioFrameRangeTest(unittest.TestCase):
         )
 
         self.assertEqual(frame_range, (7, 33))
+
+    def test_returns_empty_range_for_completely_silent_audio(self):
+        """A non-empty all-zero waveform should contain no active frames."""
+        fake_librosa = SimpleNamespace(
+            load=mock.Mock(return_value=(np.zeros(16000, dtype=np.float32), 16000)),
+            effects=SimpleNamespace(
+                trim=mock.Mock(side_effect=AssertionError("trim should not run for silence"))
+            ),
+        )
+
+        with mock.patch.dict("sys.modules", {"librosa": fake_librosa}):
+            frame_range = get_active_audio_frame_range("silent.wav", fps=25)
+
+        self.assertEqual(frame_range, (0, 0))
 
 
 class ParseBoolTest(unittest.TestCase):

@@ -28,6 +28,8 @@ from musetalk.utils.face_parsing import FaceParsing
 from musetalk.utils.mask_utils import adjust_face_box
 from musetalk.utils.audio_processor import AudioProcessor
 from musetalk.utils.audio_utils import get_active_audio_frame_range, parse_bool
+from musetalk.utils.resource_utils import release_torch_resources
+from musetalk.utils.sequence_utils import build_ping_pong_cycle
 from musetalk.utils.utils import get_file_type, get_video_fps, datagen, load_all_model
 from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder, release_landmark_models
 
@@ -103,6 +105,24 @@ def main(args):
     # Process each task
     has_error = False
     for task_id in inference_config:
+        vae = None
+        unet = None
+        pe = None
+        whisper = None
+        fp = None
+        audio_processor = None
+        timesteps = None
+        whisper_input_features = None
+        whisper_chunks = None
+        input_latent_list = None
+        input_latent_list_cycle = None
+        gen = None
+        res_frame_list = None
+        whisper_batch = None
+        latent_batch = None
+        audio_feature_batch = None
+        pred_latents = None
+        recon = None
         try:
             # Get task configuration
             video_path = inference_config[task_id]["video_path"]
@@ -233,9 +253,10 @@ def main(args):
                 f"{active_audio_end_frame}/{len(whisper_chunks)}; leading and trailing "
                 "silence will use the neutral mouth"
             )
-            del whisper
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            whisper_cleanup_errors = release_torch_resources(whisper)
+            for cleanup_error in whisper_cleanup_errors:
+                print(f"Warning: failed to release Whisper model: {cleanup_error}")
+            whisper = None
 
             if args.bbox_smooth_window > 1:
                 print(f"Smoothing bbox coordinates with window size: {args.bbox_smooth_window}")
@@ -317,9 +338,9 @@ def main(args):
         
             # Ping-Pong mirror cycle to eliminate seam at loop boundary
             # Original: [0, 1, ..., N-1] → Extended: [0, 1, ..., N-1, N-2, ..., 1]
-            frame_list_cycle = frame_list + frame_list[-2::-1] if len(frame_list) > 1 else frame_list
-            coord_list_cycle = coord_list + coord_list[-2::-1] if len(coord_list) > 1 else coord_list
-            input_latent_list_cycle = input_latent_list + input_latent_list[-2::-1] if len(input_latent_list) > 1 else input_latent_list
+            frame_list_cycle = build_ping_pong_cycle(frame_list)
+            coord_list_cycle = build_ping_pong_cycle(coord_list)
+            input_latent_list_cycle = build_ping_pong_cycle(input_latent_list)
 
             print(f"Frame cycle length: {len(frame_list)} → {len(frame_list_cycle)} (ping-pong)")
             
@@ -481,6 +502,36 @@ def main(args):
         except Exception as e:
             print("Error occurred during processing:", e)
             has_error = True
+        finally:
+            task_resources = (
+                getattr(vae, "vae", None),
+                getattr(unet, "model", None),
+                pe,
+                whisper,
+                getattr(fp, "net", None),
+            )
+            vae = None
+            unet = None
+            pe = None
+            whisper = None
+            fp = None
+            audio_processor = None
+            timesteps = None
+            whisper_input_features = None
+            whisper_chunks = None
+            input_latent_list = None
+            input_latent_list_cycle = None
+            gen = None
+            res_frame_list = None
+            whisper_batch = None
+            latent_batch = None
+            audio_feature_batch = None
+            pred_latents = None
+            recon = None
+            cleanup_errors = release_torch_resources(*task_resources)
+            task_resources = None
+            for cleanup_error in cleanup_errors:
+                print(f"Warning: failed to release task model: {cleanup_error}")
 
     if has_error:
         print("\n❌ Error: One or more tasks failed during processing.")

@@ -29,6 +29,7 @@ from musetalk.utils.blending import get_image_prepare_material, get_image_blendi
 from musetalk.utils.mask_utils import adjust_face_box
 from musetalk.utils.utils import load_all_model, get_video_fps, get_file_type
 from musetalk.utils.audio_processor import AudioProcessor
+from musetalk.utils.sequence_utils import build_ping_pong_cycle
 
 import shutil
 import threading
@@ -244,9 +245,9 @@ class Avatar:
 
         # Ping-Pong mirror cycle to eliminate seam at loop boundary
         # Original: [0, 1, ..., N-1] → Extended: [0, 1, ..., N-1, N-2, ..., 1]
-        self.frame_list_cycle = frame_list + frame_list[-2::-1] if len(frame_list) > 1 else frame_list
-        self.coord_list_cycle = coord_list + coord_list[-2::-1] if len(coord_list) > 1 else coord_list
-        self.input_latent_list_cycle = input_latent_list + input_latent_list[-2::-1] if len(input_latent_list) > 1 else input_latent_list
+        self.frame_list_cycle = build_ping_pong_cycle(frame_list)
+        self.coord_list_cycle = build_ping_pong_cycle(coord_list)
+        self.input_latent_list_cycle = build_ping_pong_cycle(input_latent_list)
         self.mask_coords_list_cycle = []
         self.mask_list_cycle = []
 

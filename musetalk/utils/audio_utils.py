@@ -39,12 +39,14 @@ def audio_samples_to_frame_range(start_sample, end_sample, sample_rate, fps):
     return max(0, active_start_frame), max(active_start_frame, active_end_frame)
 
 
-def get_active_audio_frame_range(audio_path, fps, top_db=40.0):
+def get_active_audio_frame_range(audio_path, fps, top_db=40.0, silence_threshold=1e-4):
     """Return the video-frame range containing detected active audio."""
     import librosa
 
     audio, sample_rate = librosa.load(audio_path, sr=16000, mono=True)
     if audio.size == 0:
+        return 0, 0
+    if float(abs(audio).max()) <= silence_threshold:
         return 0, 0
 
     _, trim_indices = librosa.effects.trim(audio, top_db=top_db)
