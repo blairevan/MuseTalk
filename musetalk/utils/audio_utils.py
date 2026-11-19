@@ -39,6 +39,13 @@ def audio_samples_to_frame_range(start_sample, end_sample, sample_rate, fps):
     return max(0, active_start_frame), max(active_start_frame, active_end_frame)
 
 
+def calculate_audio_target_frames(audio_samples, sample_rate, fps):
+    """Calculate strictly aligned total video frames for the given audio duration."""
+    if audio_samples <= 0 or sample_rate <= 0 or fps <= 0:
+        return 0
+    return int(round((audio_samples / float(sample_rate)) * float(fps)))
+
+
 def get_active_audio_frame_range(audio_path, fps, top_db=40.0, silence_threshold=1e-4):
     """Return the video-frame range containing detected active audio."""
     import librosa

@@ -368,7 +368,8 @@ def main(args):
                 recon = vae.decode_latents(pred_latents)
                 for res_frame in recon:
                     res_frame_list.append(res_frame)
-            
+            res_frame_list = res_frame_list[:video_num]
+
             if args.version == "v15":
                 fp = FaceParsing(
                     left_cheek_width=args.left_cheek_width,

@@ -6,6 +6,7 @@ import numpy as np
 
 from musetalk.utils.audio_utils import (
     audio_samples_to_frame_range,
+    calculate_audio_target_frames,
     get_active_audio_frame_range,
     parse_bool,
 )
@@ -38,6 +39,20 @@ class ActiveAudioFrameRangeTest(unittest.TestCase):
             frame_range = get_active_audio_frame_range("silent.wav", fps=25)
 
         self.assertEqual(frame_range, (0, 0))
+
+
+class CalculateAudioTargetFramesTest(unittest.TestCase):
+    """Tests for strictly aligned audio duration to video frame count."""
+
+    def test_rounds_to_nearest_frame(self):
+        # 49.737143s * 30fps = 1492.11429 -> 1492 frames
+        samples = int(49.737143 * 16000)
+        self.assertEqual(calculate_audio_target_frames(samples, 16000, 30), 1492)
+
+    def test_handles_edge_cases(self):
+        self.assertEqual(calculate_audio_target_frames(0, 16000, 30), 0)
+        self.assertEqual(calculate_audio_target_frames(-100, 16000, 30), 0)
+        self.assertEqual(calculate_audio_target_frames(16000, 16000, 25), 25)
 
 
 class ParseBoolTest(unittest.TestCase):

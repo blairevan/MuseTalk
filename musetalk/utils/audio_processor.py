@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from einops import rearrange
 from transformers import AutoFeatureExtractor
+from musetalk.utils.audio_utils import ensure_wav, calculate_audio_target_frames
 
 
 class AudioProcessor:
@@ -15,7 +16,8 @@ class AudioProcessor:
     def get_audio_feature(self, wav_path, start_index=0, weight_dtype=None):
         if not os.path.exists(wav_path):
             return None
-        librosa_output, sampling_rate = librosa.load(wav_path, sr=16000)
+        wav_path_converted = ensure_wav(wav_path)
+        librosa_output, sampling_rate = librosa.load(wav_path_converted, sr=16000)
         assert sampling_rate == 16000
         # Split audio into 30s segments
         segment_length = 30 * sampling_rate
@@ -60,8 +62,8 @@ class AudioProcessor:
         audio_fps = 50
         fps = float(fps)
         whisper_idx_multiplier = audio_fps / fps
-        num_frames = math.floor((librosa_length / sr) * fps)
-        actual_length = math.floor((librosa_length / sr) * audio_fps)
+        num_frames = calculate_audio_target_frames(librosa_length, sr, fps)
+        actual_length = math.ceil((librosa_length / sr) * audio_fps)
         whisper_feature = whisper_feature[:,:actual_length,...]
 
         # Calculate padding amount
@@ -99,4 +101,3 @@ if __name__ == "__main__":
     audio_feature, librosa_feature_length = audio_processor.get_audio_feature(wav_path)
     print("Audio Feature shape:", audio_feature.shape)
     print("librosa_feature_length:", librosa_feature_length)
-
