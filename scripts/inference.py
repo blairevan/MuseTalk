@@ -1,6 +1,6 @@
 import os
+import tempfile
 import cv2
-import copy
 import torch
 
 # --- PyTorch 2.6+ Compatibility Monkey Patch ---
@@ -13,7 +13,6 @@ torch.load = _patched_load
 # ---------------------------------------------
 
 import glob
-import shutil
 import pickle
 import argparse
 import numpy as np
@@ -28,10 +27,11 @@ from musetalk.utils.face_parsing import FaceParsing
 from musetalk.utils.mask_utils import adjust_face_box
 from musetalk.utils.audio_processor import AudioProcessor
 from musetalk.utils.audio_utils import get_active_audio_frame_range, parse_bool
+from musetalk.utils.frame_io import FrameSequence
 from musetalk.utils.resource_utils import release_torch_resources
 from musetalk.utils.sequence_utils import build_ping_pong_cycle
 from musetalk.utils.utils import get_file_type, get_video_fps, datagen, load_all_model
-from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, coord_placeholder, release_landmark_models
+from musetalk.utils.preprocessing import get_frame_bboxes, coord_placeholder, release_landmark_models
 
 def smooth_bbox_sequence(coord_list, window_size):
     """Smooth valid face bounding boxes while stabilizing crop scale over time."""
@@ -123,6 +123,7 @@ def main(args):
         audio_feature_batch = None
         pred_latents = None
         recon = None
+        task_directory = None
         try:
             # Get task configuration
             video_path = inference_config[task_id]["video_path"]
@@ -152,8 +153,9 @@ def main(args):
             temp_dir = os.path.join(args.result_dir, f"{args.version}")
             os.makedirs(temp_dir, exist_ok=True)
             
-            # Set result save paths
-            result_img_save_path = os.path.join(temp_dir, output_basename)
+            # Keep temporary frames separate across jobs and retries.
+            task_directory = tempfile.TemporaryDirectory(prefix="inference-", dir=temp_dir)
+            result_img_save_path = os.path.join(task_directory.name, "rendered")
             crop_coord_save_path = os.path.join(args.result_dir, "../", input_basename+".pkl")
             os.makedirs(result_img_save_path, exist_ok=True)
             
@@ -162,16 +164,16 @@ def main(args):
                 output_vid_name = os.path.join(temp_dir, output_basename + ".mp4")
             else:
                 output_vid_name = os.path.join(temp_dir, args.output_vid_name)
-            output_vid_name_concat = os.path.join(temp_dir, output_basename + "_concat.mp4")
             
             # Extract frames from source video
             if get_file_type(video_path) == "video":
-                save_dir_full = os.path.join(temp_dir, input_basename)
+                save_dir_full = os.path.join(task_directory.name, "source")
                 os.makedirs(save_dir_full, exist_ok=True)
-                cmd = f"ffmpeg -v fatal -i {video_path} -start_number 0 {save_dir_full}/%08d.png"
-                ret_code = os.system(cmd)
-                if ret_code != 0:
-                    raise RuntimeError(f"ffmpeg frame extraction failed with status code {ret_code}.")
+                subprocess.run(
+                    ["ffmpeg", "-nostdin", "-v", "error", "-i", video_path,
+                     "-start_number", "0", os.path.join(save_dir_full, "%08d.png")],
+                    check=True,
+                )
                 input_img_list = sorted(glob.glob(os.path.join(save_dir_full, '*.[jpJP][pnPN]*[gG]')))
                 if not input_img_list:
                     raise ValueError(f"No frames extracted from {video_path}. The video may be corrupted (e.g., moov atom missing).")
@@ -191,15 +193,22 @@ def main(args):
                 raise ValueError(f"{video_path} should be a video file, an image file or a directory of images")
 
             # Preprocess input images
+            frames = FrameSequence(input_img_list)
             try:
+                coord_list = None
                 if os.path.exists(crop_coord_save_path) and args.use_saved_coord:
-                    print("Using saved coordinates")
                     with open(crop_coord_save_path, 'rb') as f:
-                        coord_list = pickle.load(f)
-                    frame_list = read_imgs(input_img_list)
-                else:
+                        saved_coords = pickle.load(f)
+                    if len(saved_coords) == len(frames):
+                        print("Using saved coordinates")
+                        coord_list = saved_coords
+                    else:
+                        print("Ignoring saved coordinates with a different frame count")
+                if coord_list is None:
                     print("Extracting landmarks... time-consuming operation")
-                    coord_list, frame_list = get_landmark_and_bbox(input_img_list, bbox_shift)
+                    coord_list = get_frame_bboxes(frames, bbox_shift)
+                    if len(coord_list) != len(frames):
+                        raise ValueError("Expected one face box per source frame")
                     with open(crop_coord_save_path, 'wb') as f:
                         pickle.dump(coord_list, f)
             finally:
@@ -262,9 +271,9 @@ def main(args):
                 print(f"Smoothing bbox coordinates with window size: {args.bbox_smooth_window}")
                 coord_list = smooth_bbox_sequence(coord_list, args.bbox_smooth_window)
             
-            print(f"Number of frames: {len(frame_list)}")         
+            print(f"Number of frames: {len(frames)}")
             
-            # Process each frame (ensuring strict length alignment with frame_list to prevent cumulative index drift)
+            # Keep box and latent indices aligned with the source frames.
             input_latent_list = []
             last_valid_bbox = None
             last_valid_latents = None
@@ -272,8 +281,9 @@ def main(args):
             # Find the first valid bbox and latents as initial fallback
             first_valid_bbox = None
             first_valid_latents = None
-            for bbox, frame in zip(coord_list, frame_list):
+            for index, bbox in enumerate(coord_list):
                 if bbox != coord_placeholder and (bbox[2]-bbox[0]) > 0 and (bbox[3]-bbox[1]) > 0:
+                    frame = frames[index]
                     x1, y1, x2, y2 = bbox
                     if args.version == "v15":
                         x1, y1, x2, y2 = adjust_face_box(
@@ -304,13 +314,14 @@ def main(args):
             last_valid_bbox = first_valid_bbox
             last_valid_latents = first_valid_latents
 
-            for idx, (bbox, frame) in enumerate(zip(coord_list, frame_list)):
+            for idx, bbox in enumerate(coord_list):
                 if bbox == coord_placeholder or (bbox[2]-bbox[0]) <= 0 or (bbox[3]-bbox[1]) <= 0:
                     # Face detection failed, fallback to previous valid frame data without skipping
                     coord_list[idx] = last_valid_bbox
                     input_latent_list.append(last_valid_latents)
                     continue
                 
+                frame = frames[idx]
                 x1, y1, x2, y2 = bbox
                 if args.version == "v15":
                     x1, y1, x2, y2 = adjust_face_box(
@@ -338,11 +349,10 @@ def main(args):
         
             # Ping-Pong mirror cycle to eliminate seam at loop boundary
             # Original: [0, 1, ..., N-1] → Extended: [0, 1, ..., N-1, N-2, ..., 1]
-            frame_list_cycle = build_ping_pong_cycle(frame_list)
-            coord_list_cycle = build_ping_pong_cycle(coord_list)
-            input_latent_list_cycle = build_ping_pong_cycle(input_latent_list)
+            frame_index_cycle = build_ping_pong_cycle(list(range(len(frames))))
+            input_latent_list_cycle = [input_latent_list[index] for index in frame_index_cycle]
 
-            print(f"Frame cycle length: {len(frame_list)} → {len(frame_list_cycle)} (ping-pong)")
+            print(f"Frame cycle length: {len(frames)} → {len(frame_index_cycle)} (ping-pong)")
             
             # Batch inference
             print("Starting inference")
@@ -380,7 +390,6 @@ def main(args):
 
             # Pad generated images to original video size
             print("Padding generated images to original video size")
-            neutral_frame = copy.deepcopy(frame_list[0])
             neutral_bbox = coord_list[0]
             neutral_face = None
             if (
@@ -388,6 +397,7 @@ def main(args):
                 and (neutral_bbox[2] - neutral_bbox[0]) > 0
                 and (neutral_bbox[3] - neutral_bbox[1]) > 0
             ):
+                neutral_frame = frames[0]
                 neutral_x1, neutral_y1, neutral_x2, neutral_y2 = neutral_bbox
                 if args.version == "v15":
                     neutral_x1, neutral_y1, neutral_x2, neutral_y2 = adjust_face_box(
@@ -399,11 +409,13 @@ def main(args):
                         bbox_bottom_ratio=args.bbox_bottom_ratio
                     )
                     neutral_y2 = min(neutral_y2 + args.extra_margin, neutral_frame.shape[0])
-                neutral_face = neutral_frame[neutral_y1:neutral_y2, neutral_x1:neutral_x2]
+                neutral_face = neutral_frame[neutral_y1:neutral_y2, neutral_x1:neutral_x2].copy()
+                del neutral_frame
 
             for i, res_frame in enumerate(tqdm(res_frame_list)):
-                bbox = coord_list_cycle[i%(len(coord_list_cycle))]
-                ori_frame = copy.deepcopy(frame_list_cycle[i%(len(frame_list_cycle))])
+                source_index = frame_index_cycle[i % len(frame_index_cycle)]
+                bbox = coord_list[source_index]
+                ori_frame = frames[source_index]
                 x1, y1, x2, y2 = bbox
                 
                 # If no face is detected or coordinate is invalid, fallback to original frame to avoid sequence gap
@@ -482,20 +494,22 @@ def main(args):
                     cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", ori_frame)
 
             # Save prediction results
-            temp_vid_path = f"{temp_dir}/temp_{input_basename}_{audio_basename}.mp4"
-            cmd_img2video = f"ffmpeg -y -v warning -r {fps} -f image2 -i {result_img_save_path}/%08d.png -vcodec libx264 -vf format=yuv420p -crf 18 {temp_vid_path}"
+            temp_vid_path = os.path.join(task_directory.name, "rendered.mp4")
+            cmd_img2video = [
+                "ffmpeg", "-nostdin", "-y", "-v", "warning", "-r", str(fps), "-f", "image2",
+                "-i", os.path.join(result_img_save_path, "%08d.png"), "-vcodec", "libx264",
+                "-vf", "format=yuv420p", "-crf", "18", temp_vid_path,
+            ]
             print("Video generation command:", cmd_img2video)
-            os.system(cmd_img2video)   
+            subprocess.run(cmd_img2video, check=True)
             
-            cmd_combine_audio = f"ffmpeg -y -v warning -i {audio_path} -i {temp_vid_path} {output_vid_name}"
+            cmd_combine_audio = [
+                "ffmpeg", "-nostdin", "-y", "-v", "warning",
+                "-i", audio_path, "-i", temp_vid_path, output_vid_name,
+            ]
             print("Audio combination command:", cmd_combine_audio) 
-            os.system(cmd_combine_audio)
+            subprocess.run(cmd_combine_audio, check=True)
             
-            # Clean up temporary files
-            shutil.rmtree(result_img_save_path)
-            os.remove(temp_vid_path)
-            
-            shutil.rmtree(save_dir_full)
             if not args.saved_coord:
                 os.remove(crop_coord_save_path)
                     
@@ -504,6 +518,8 @@ def main(args):
             print("Error occurred during processing:", e)
             has_error = True
         finally:
+            if task_directory is not None:
+                task_directory.cleanup()
             task_resources = (
                 getattr(vae, "vae", None),
                 getattr(unet, "model", None),

@@ -103,28 +103,31 @@ def get_bbox_range(img_list,upperbondrange =0):
     return text_range
     
 
-def get_landmark_and_bbox(img_list,upperbondrange =0):
+def get_landmark_and_bbox(img_list, upperbondrange=0):
+    """Return face boxes and decoded frames for callers that retain both."""
     frames = read_imgs(img_list)
+    return get_frame_bboxes(frames, upperbondrange), frames
+
+
+def get_frame_bboxes(frames, upperbondrange=0):
+    """Detect one face box per source frame while iterating over the frames."""
     pose_model, face_alignment = get_landmark_models()
-    batch_size_fa = 1
     coords_list = []
-    landmarks = []
     if upperbondrange != 0:
         print('get key_landmark and face bounding boxes with the bbox_shift:',upperbondrange)
     else:
         print('get key_landmark and face bounding boxes with the default value')
     average_range_minus = []
     average_range_plus = []
-    for batch_start in tqdm(range(0, len(frames), batch_size_fa)):
-        fb = frames[batch_start:batch_start + batch_size_fa]
-        results = inference_topdown(pose_model, np.asarray(fb)[0])
+    for frame_number, frame in enumerate(tqdm(frames), start=1):
+        results = inference_topdown(pose_model, frame.copy())
         results = merge_data_samples(results)
         keypoints = results.pred_instances.keypoints
         face_land_mark= keypoints[0][23:91]
         face_land_mark = face_land_mark.astype(np.int32)
         
         # get bounding boxes by face detetion
-        bbox = face_alignment.get_detections_for_batch(np.asarray(fb))
+        bbox = face_alignment.get_detections_for_batch(frame[None, ...])
         
         # adjust the bounding box refer to landmark
         # Add the bounding box to a tuple and append it to the coordinates list
@@ -153,12 +156,15 @@ def get_landmark_and_bbox(img_list,upperbondrange =0):
                 print("error bbox:",f)
             else:
                 coords_list += [f_landmark]
-        clear_cuda_cache_periodically(batch_start + len(fb))
+        clear_cuda_cache_periodically(frame_number)
     
     print("********************************************bbox_shift parameter adjustment**********************************************************")
-    print(f"Total frame:「{len(frames)}」 Manually adjust range : [ -{int(sum(average_range_minus) / len(average_range_minus))}~{int(sum(average_range_plus) / len(average_range_plus))} ] , the current value: {upperbondrange}")
+    if average_range_minus:
+        print(f"Total frame:「{len(frames)}」 Manually adjust range : [ -{int(sum(average_range_minus) / len(average_range_minus))}~{int(sum(average_range_plus) / len(average_range_plus))} ] , the current value: {upperbondrange}")
+    else:
+        print(f"No face detected in {len(frames)} source frames.")
     print("*************************************************************************************************************************************")
-    return coords_list,frames
+    return coords_list
     
 
 if __name__ == "__main__":
