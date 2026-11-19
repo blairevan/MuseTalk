@@ -17,3 +17,5 @@ debug
 exp_out
 .gradio
 .playwright-mcp/
+/HANDOFF.md
+/.superpowers/

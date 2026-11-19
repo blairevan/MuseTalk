@@ -300,7 +300,7 @@ We provide a convenient CLI wrapper `run_cli.py` for direct inference without ma
 python run_cli.py --face ./data/video/select_ref.mp4 --audio ./data/audio/monalisa.wav --outfile ./output/result.mp4 --model_version v1.5
 ```
 
-For detailed parameters and micro-tuning guide, please refer to [run_cli_usage.md](file:///opt/app/aining/digital_human/MuseTalk/run_cli_usage.md).
+For detailed parameters and micro-tuning, see the [CLI usage guide](run_cli_usage.md).
 
 
 
@@ -554,3 +554,9 @@ If you need higher resolution, you could apply super resolution models such as [
 1. `other opensource model`: Other open-source models used must comply with their license, such as `whisper`, `ft-mse-vae`, `dwpose`, `S3FD`, etc..
 1. The testdata are collected from internet, which are available for non-commercial research purposes only.
 1. `AIGC`: This project strives to impact the domain of AI-driven video generation positively. Users are granted the freedom to create videos using this tool, but they are expected to comply with local laws and utilize it responsibly. The developers do not assume any responsibility for potential misuse by users.
+
+## Revision History
+
+| Date and time | Changes |
+| --- | --- |
+| 2026-11-19 11:21:49 +08:00 | Replaced the machine-specific CLI guide link with a repository-relative link. |
