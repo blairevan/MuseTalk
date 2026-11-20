@@ -17,9 +17,16 @@ def load_all_model(
     vae_type="sd-vae",
     unet_config=os.path.join("models", "musetalkV15", "musetalk.json"),
     device=None,
+    vae_latent_mode="sample",
 ):
+    """Load the VAE, UNet and audio positional encoding used for inference.
+
+    Args:
+        vae_latent_mode (str): ``"sample"`` (legacy) or ``"mode"`` for VAE encoding.
+    """
     vae = VAE(
         model_path = os.path.join("models", vae_type),
+        latent_mode=vae_latent_mode,
     )
     print(f"load unet model from {unet_model_path}")
     unet = UNet(

@@ -17,6 +17,7 @@ import pickle
 import argparse
 import numpy as np
 import subprocess
+from PIL import Image
 from tqdm import tqdm
 from omegaconf import OmegaConf
 from transformers import WhisperModel
@@ -26,7 +27,21 @@ from musetalk.utils.blending import get_image
 from musetalk.utils.face_parsing import FaceParsing
 from musetalk.utils.mask_utils import adjust_face_box
 from musetalk.utils.audio_processor import AudioProcessor
-from musetalk.utils.audio_utils import get_active_audio_frame_range, parse_bool
+from musetalk.utils.audio_utils import (
+    build_audio_mux_command,
+    get_active_audio_frame_intervals,
+    get_active_audio_frame_range,
+    parse_bool,
+    pause_close_weights,
+)
+from musetalk.utils.clarity import (
+    ENHANCE_MODES,
+    PASTE_INTERPOLATION_MODES,
+    blend_faces,
+    correct_teeth_whiteness,
+    resize_generated_face,
+    sharpen_lip_region,
+)
 from musetalk.utils.frame_io import FrameSequence
 from musetalk.utils.resource_utils import release_torch_resources
 from musetalk.utils.sequence_utils import build_ping_pong_cycle
@@ -83,6 +98,30 @@ def fast_check_ffmpeg():
         return True
     except:
         return False
+
+def enhance_generated_face(face, args, fp):
+    """Apply the opt-in teeth correction and lip sharpening to a resized face.
+
+    Args:
+        face (np.ndarray): Generated BGR face resized to the destination box.
+        args (argparse.Namespace): Parsed CLI options.
+        fp (FaceParsing | None): Face parser used to find the mouth interior.
+
+    Returns:
+        np.ndarray: Enhanced face, or the input when every option is off.
+    """
+    if args.fix_teeth_whiteness and fp is not None:
+        mouth_mask = None
+        try:
+            parsed = fp(Image.fromarray(face[:, :, ::-1]), mode="mouth")
+            parsed = parsed.resize((face.shape[1], face.shape[0]), Image.NEAREST)
+            mouth_mask = np.array(parsed)
+        except Exception as e:
+            print(f"Warning: mouth parsing failed, skipping teeth correction: {e}")
+        face = correct_teeth_whiteness(face, mouth_mask)
+    if args.enhance_mode == "usm":
+        face = sharpen_lip_region(face, amount_override=args.usm_amount)
+    return face
 
 @torch.no_grad()
 def main(args):
@@ -209,8 +248,11 @@ def main(args):
                     coord_list = get_frame_bboxes(frames, bbox_shift)
                     if len(coord_list) != len(frames):
                         raise ValueError("Expected one face box per source frame")
-                    with open(crop_coord_save_path, 'wb') as f:
-                        pickle.dump(coord_list, f)
+                    # Only persist coordinates on request: the file is keyed by the face
+                    # file name and shared by every task with the same template
+                    if args.saved_coord:
+                        with open(crop_coord_save_path, 'wb') as f:
+                            pickle.dump(coord_list, f)
             finally:
                 release_landmark_models()
 
@@ -219,7 +261,8 @@ def main(args):
                 unet_model_path=args.unet_model_path,
                 vae_type=args.vae_type,
                 unet_config=args.unet_config,
-                device=device
+                device=device,
+                vae_latent_mode=args.vae_latent_mode,
             )
             timesteps = torch.tensor([0], device=device)
 
@@ -262,6 +305,23 @@ def main(args):
                 f"{active_audio_end_frame}/{len(whisper_chunks)}; leading and trailing "
                 "silence will use the neutral mouth"
             )
+            pause_weights = np.zeros(len(whisper_chunks), dtype=np.float32)
+            if args.close_mouth_pauses:
+                voiced_intervals = get_active_audio_frame_intervals(
+                    audio_path,
+                    fps,
+                    top_db=args.pause_top_db,
+                )
+                pause_weights = pause_close_weights(
+                    voiced_intervals,
+                    len(whisper_chunks),
+                    min_pause_frames=args.pause_min_frames,
+                    fade_frames=args.pause_fade_frames,
+                )
+                print(
+                    f"Mid-sentence pauses: {int(np.count_nonzero(pause_weights))} frames "
+                    "blend toward the neutral mouth"
+                )
             whisper_cleanup_errors = release_torch_resources(whisper)
             for cleanup_error in whisper_cleanup_errors:
                 print(f"Warning: failed to release Whisper model: {cleanup_error}")
@@ -371,7 +431,7 @@ def main(args):
             
             # Execute inference
             for i, (whisper_batch, latent_batch) in enumerate(tqdm(gen, total=total)):
-                audio_feature_batch = pe(whisper_batch)
+                audio_feature_batch = pe(whisper_batch) if args.use_audio_pe else whisper_batch
                 latent_batch = latent_batch.to(dtype=unet.model.dtype)
                 
                 pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
@@ -435,13 +495,16 @@ def main(args):
                     y2 = y2 + args.extra_margin
                     y2 = min(y2, ori_frame.shape[0])
 
+                pause_weight = float(pause_weights[i]) if i < len(pause_weights) else 0.0
+                has_neutral_face = neutral_face is not None and neutral_face.size > 0
                 should_close_mouth = (
                     (i < active_audio_start_frame and args.close_mouth_start)
                     or (i >= active_audio_end_frame and args.close_mouth_end)
+                    or (pause_weight >= 1.0 and has_neutral_face)
                 )
                 if should_close_mouth:
                     try:
-                        if neutral_face is None or neutral_face.size == 0:
+                        if not has_neutral_face:
                             raise ValueError("Neutral reference face is unavailable")
                         closed_face = cv2.resize(
                             neutral_face,
@@ -455,14 +518,16 @@ def main(args):
                                 [x1, y1, x2, y2],
                                 mode=args.parsing_mode,
                                 fp=fp,
-                                side_protect_ratio=args.side_protect_ratio
+                                side_protect_ratio=args.side_protect_ratio,
+                                protect_upper_face=args.protect_upper_face,
                             )
                         else:
                             combine_frame = get_image(
                                 ori_frame,
                                 closed_face,
                                 [x1, y1, x2, y2],
-                                fp=fp
+                                fp=fp,
+                                protect_upper_face=args.protect_upper_face,
                             )
                         cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", combine_frame)
                     except Exception as e:
@@ -471,10 +536,24 @@ def main(args):
                     continue
 
                 try:
-                    res_frame = cv2.resize(res_frame.astype(np.uint8), (x2-x1, y2-y1))
+                    res_frame = resize_generated_face(
+                        res_frame, x2 - x1, y2 - y1, mode=args.paste_interpolation
+                    )
                 except Exception as e:
                     cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", ori_frame)
                     continue
+
+                # Opt-in teeth correction and lip sharpening of the generated face
+                res_frame = enhance_generated_face(res_frame, args, fp)
+
+                # Fade toward the neutral mouth at the edges of mid-sentence pauses
+                if pause_weight > 0.0 and has_neutral_face:
+                    closed_face = cv2.resize(
+                        neutral_face,
+                        (x2 - x1, y2 - y1),
+                        interpolation=cv2.INTER_LANCZOS4
+                    )
+                    res_frame = blend_faces(res_frame, closed_face, pause_weight)
                 
                 # Merge results with version-specific parameters
                 try:
@@ -485,10 +564,17 @@ def main(args):
                             [x1, y1, x2, y2],
                             mode=args.parsing_mode,
                             fp=fp,
-                            side_protect_ratio=args.side_protect_ratio
+                            side_protect_ratio=args.side_protect_ratio,
+                            protect_upper_face=args.protect_upper_face,
                         )
                     else:
-                        combine_frame = get_image(ori_frame, res_frame, [x1, y1, x2, y2], fp=fp)
+                        combine_frame = get_image(
+                            ori_frame,
+                            res_frame,
+                            [x1, y1, x2, y2],
+                            fp=fp,
+                            protect_upper_face=args.protect_upper_face,
+                        )
                     cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", combine_frame)
                 except Exception as e:
                     cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", ori_frame)
@@ -503,16 +589,10 @@ def main(args):
             print("Video generation command:", cmd_img2video)
             subprocess.run(cmd_img2video, check=True)
             
-            cmd_combine_audio = [
-                "ffmpeg", "-nostdin", "-y", "-v", "warning",
-                "-i", audio_path, "-i", temp_vid_path, output_vid_name,
-            ]
+            cmd_combine_audio = build_audio_mux_command(audio_path, temp_vid_path, output_vid_name)
             print("Audio combination command:", cmd_combine_audio) 
             subprocess.run(cmd_combine_audio, check=True)
             
-            if not args.saved_coord:
-                os.remove(crop_coord_save_path)
-                    
             print(f"Results saved to {output_vid_name}")
         except Exception as e:
             print("Error occurred during processing:", e)
@@ -586,5 +666,26 @@ if __name__ == "__main__":
     parser.add_argument("--close_mouth_start", type=parse_bool, default=True, help="Close mouth during leading silence (true/false)")
     parser.add_argument("--close_mouth_end", type=parse_bool, default=False, help="Close mouth during trailing silence (true/false)")
     parser.add_argument("--version", type=str, default="v15", choices=["v1", "v15"], help="Model version to use")
+    # Clarity options. The first four defaults were adopted after 4K A/B runs on
+    # an RTX 5070; pass the legacy values to reproduce the previous output.
+    parser.add_argument("--vae_latent_mode", type=str, default="mode", choices=["sample", "mode"],
+                        help="VAE encoding: 'mode' (deterministic, matches training) or 'sample' (legacy)")
+    parser.add_argument("--paste_interpolation", type=str, default="lanczos", choices=list(PASTE_INTERPOLATION_MODES),
+                        help="Resize when pasting the generated face: 'lanczos' (area down, Lanczos up) or 'linear' (legacy)")
+    parser.add_argument("--enhance_mode", type=str, default="usm", choices=list(ENHANCE_MODES),
+                        help="Lip clarity enhancement: 'usm' (luma unsharp mask on the lip area) or 'none' (legacy)")
+    parser.add_argument("--usm_amount", type=float, default=-1.0,
+                        help="Unsharp-mask amount; negative selects it from the face enlargement factor")
+    parser.add_argument("--fix_teeth_whiteness", type=parse_bool, default=False,
+                        help="Tone down over-bright teeth inside the parsed mouth interior (true/false)")
+    parser.add_argument("--protect_upper_face", type=parse_bool, default=True,
+                        help="Keep exact source pixels above the blend boundary (true/false; legacy false)")
+    parser.add_argument("--close_mouth_pauses", type=parse_bool, default=False,
+                        help="Blend to the neutral mouth during mid-sentence pauses (true/false)")
+    parser.add_argument("--pause_min_frames", type=int, default=8, help="Shortest pause, in frames, that closes the mouth")
+    parser.add_argument("--pause_fade_frames", type=int, default=4, help="Frames used to fade into and out of a pause")
+    parser.add_argument("--pause_top_db", type=float, default=38.0, help="Silence threshold below the audio peak, in dB")
+    parser.add_argument("--use_audio_pe", type=parse_bool, default=True,
+                        help="Add positional encoding to Whisper features (legacy true; for A/B against training)")
     args = parser.parse_args()
     main(args)

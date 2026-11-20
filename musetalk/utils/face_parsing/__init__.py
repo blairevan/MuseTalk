@@ -103,6 +103,10 @@ class FaceParsing():
                 parsing[(face_region==255) & (~np.isin(parsing, [10]))] = 255         
                 parsing[np.isin(parsing, [11, 12, 13])] = 255
                 parsing[np.where(parsing!=255)] = 0
+            elif mode == "mouth":
+                # Mouth interior only (class 11), used to locate generated teeth
+                parsing[np.isin(parsing, [11])] = 255
+                parsing[np.where(parsing!=255)] = 0
             else:
                 parsing[np.isin(parsing, [1, 11, 12, 13])] = 255
                 parsing[np.where(parsing!=255)] = 0

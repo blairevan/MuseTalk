@@ -3,7 +3,41 @@ import numpy as np
 import cv2
 import copy
 
-from musetalk.utils.mask_utils import apply_side_protect_mask
+from musetalk.utils.mask_utils import apply_side_protect_mask, confine_mask_below
+
+
+def _build_lower_face_alpha(mask_image, ori_shape, face_rect, upper_boundary_ratio,
+                            blur_ratio, side_protect_ratio, protect_upper_face):
+    """Keep the lower part of a parsing mask, feather it, and optionally lock the upper face.
+
+    Args:
+        mask_image (PIL.Image.Image): Parsing mask covering the expanded crop.
+        ori_shape (tuple[int, int]): Expanded crop size ``(width, height)``.
+        face_rect (tuple[int, int, int, int]): Face box inside the crop.
+        upper_boundary_ratio (float): Fraction of crop height above which the
+            source frame is kept.
+        blur_ratio (float): Gaussian kernel size as a fraction of crop width.
+        side_protect_ratio (float): Side-edge fade ratio.
+        protect_upper_face (bool): When true, the feather is moved below the
+            boundary and every row above it gets zero alpha, so the upper face
+            keeps the exact source pixels.
+
+    Returns:
+        np.ndarray: ``uint8`` alpha mask of the crop.
+    """
+    width, height = mask_image.size
+    top_boundary = int(height * upper_boundary_ratio)
+    blur_kernel_size = int(blur_ratio * ori_shape[0] // 2 * 2) + 1
+    paste_top = top_boundary + blur_kernel_size // 2 if protect_upper_face else top_boundary
+    paste_top = min(paste_top, height)
+
+    modified_mask_image = Image.new('L', ori_shape, 0)
+    modified_mask_image.paste(mask_image.crop((0, paste_top, width, height)), (0, paste_top))
+    mask_array = cv2.GaussianBlur(np.array(modified_mask_image), (blur_kernel_size, blur_kernel_size), 0)
+    mask_array = apply_side_protect_mask(mask_array, face_rect, side_protect_ratio)
+    if protect_upper_face:
+        mask_array = confine_mask_below(mask_array, top_boundary)
+    return mask_array
 
 
 def get_crop_box(box, expand):
@@ -35,7 +69,7 @@ def face_seg(image, mode="raw", fp=None):
 
 
 def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode="raw",
-              fp=None, side_protect_ratio=0.0):
+              fp=None, side_protect_ratio=0.0, protect_upper_face=False):
     """
     将裁剪的面部图像粘贴回原始图像，并进行一些处理。
 
@@ -47,6 +81,7 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
         expand (float): 扩展因子，用于放大裁剪框。
         mode: 融合mask构建方式
         side_protect_ratio: 左右边缘保护比例，用于降低耳朵和头发附近的融合强度。
+        protect_upper_face: 为 True 时上半区 alpha 严格为 0，上半脸保持原帧像素。
 
     Returns:
         numpy.ndarray: 处理后的图像。
@@ -74,19 +109,17 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
     mask_image.paste(mask_small, (x - x_s, y - y_s, x1 - x_s, y1 - y_s))  # 将面部掩码粘贴到全黑图像上
     
     
-    # 保留面部区域的上半部分（用于控制说话区域）
-    width, height = mask_image.size
-    top_boundary = int(height * upper_boundary_ratio)  # 计算上半部分的边界
-    modified_mask_image = Image.new('L', ori_shape, 0)  # 创建一个新的全黑掩码图像
-    modified_mask_image.paste(mask_image.crop((0, top_boundary, width, height)), (0, top_boundary))  # 粘贴上半部分掩码
-    
-    
-    # 对掩码进行高斯模糊，使边缘更平滑
-    blur_kernel_size = int(0.05 * ori_shape[0] // 2 * 2) + 1  # 计算模糊核大小
-    mask_array = cv2.GaussianBlur(np.array(modified_mask_image), (blur_kernel_size, blur_kernel_size), 0)  # 高斯模糊
+    # 保留面部区域的下半部分（用于控制说话区域），并对掩码做高斯羽化与侧边保护
     face_rect = (x - x_s, y - y_s, x1 - x_s, y1 - y_s)
-    mask_array = apply_side_protect_mask(mask_array, face_rect, side_protect_ratio)
-    #mask_array = np.array(modified_mask_image)
+    mask_array = _build_lower_face_alpha(
+        mask_image,
+        ori_shape,
+        face_rect,
+        upper_boundary_ratio,
+        blur_ratio=0.05,
+        side_protect_ratio=side_protect_ratio,
+        protect_upper_face=protect_upper_face,
+    )
     mask_image = Image.fromarray(mask_array)  # 将模糊后的掩码转换回 PIL 图像
     
     # 将裁剪的面部图像粘贴回扩展后的面部区域
@@ -116,8 +149,16 @@ def get_image_blending(image, face, face_box, mask_array, crop_box):
 
 
 def get_image_prepare_material(image, face_box, upper_boundary_ratio=0.5, expand=1.5,
-                               fp=None, mode="raw", side_protect_ratio=0.0):
-    """Prepare reusable blend mask material for realtime inference."""
+                               fp=None, mode="raw", side_protect_ratio=0.0,
+                               blur_ratio=0.1, protect_upper_face=False):
+    """Prepare reusable blend mask material for realtime inference.
+
+    Args:
+        blur_ratio (float): Feather kernel as a fraction of crop width. The
+            legacy realtime value is ``0.1``; the offline path uses ``0.05``
+            (upstream PR #422).
+        protect_upper_face (bool): Lock the upper face to source pixels.
+    """
     body = Image.fromarray(image[:,:,::-1])
 
     x, y, x1, y1 = face_box
@@ -133,14 +174,15 @@ def get_image_prepare_material(image, face_box, upper_boundary_ratio=0.5, expand
     mask_image = Image.new('L', ori_shape, 0)
     mask_image.paste(mask_small, (x-x_s, y-y_s, x1-x_s, y1-y_s))
 
-    # keep upper_boundary_ratio of talking area
-    width, height = mask_image.size
-    top_boundary = int(height * upper_boundary_ratio)
-    modified_mask_image = Image.new('L', ori_shape, 0)
-    modified_mask_image.paste(mask_image.crop((0, top_boundary, width, height)), (0, top_boundary))
-
-    blur_kernel_size = int(0.1 * ori_shape[0] // 2 * 2) + 1
-    mask_array = cv2.GaussianBlur(np.array(modified_mask_image), (blur_kernel_size, blur_kernel_size), 0)
+    # keep the lower part of the talking area, feather it and protect the sides
     face_rect = (x - x_s, y - y_s, x1 - x_s, y1 - y_s)
-    mask_array = apply_side_protect_mask(mask_array, face_rect, side_protect_ratio)
+    mask_array = _build_lower_face_alpha(
+        mask_image,
+        ori_shape,
+        face_rect,
+        upper_boundary_ratio,
+        blur_ratio=blur_ratio,
+        side_protect_ratio=side_protect_ratio,
+        protect_upper_face=protect_upper_face,
+    )
     return mask_array, crop_box

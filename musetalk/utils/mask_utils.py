@@ -119,3 +119,19 @@ def apply_side_protect_mask(mask_array, face_rect, side_protect_ratio=0.0):
         ).astype(mask_array.dtype)
 
     return protected_mask.astype(mask_array.dtype, copy=False)
+
+
+def confine_mask_below(mask_array, top_row):
+    """Zero every alpha value above ``top_row`` so those pixels keep the source frame.
+
+    Args:
+        mask_array (np.ndarray): Single-channel alpha mask.
+        top_row (int): First row that may keep non-zero alpha.
+
+    Returns:
+        np.ndarray: Copy of the mask with rows ``[0, top_row)`` set to zero.
+    """
+    confined = np.array(mask_array, copy=True)
+    top_row = int(np.clip(top_row, 0, confined.shape[0]))
+    confined[:top_row] = 0
+    return confined

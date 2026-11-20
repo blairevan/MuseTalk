@@ -12,14 +12,20 @@ class VAE():
     VAE (Variational Autoencoder) class for image processing.
     """
 
-    def __init__(self, model_path="./models/sd-vae-ft-mse/", resized_img=256, use_float16=False):
+    def __init__(self, model_path="./models/sd-vae-ft-mse/", resized_img=256, use_float16=False,
+                 latent_mode="sample"):
         """
         Initialize the VAE instance.
 
         :param model_path: Path to the trained model.
         :param resized_img: The size to which images are resized.
         :param use_float16: Whether to use float16 precision.
+        :param latent_mode: ``"sample"`` (legacy) draws from the posterior;
+            ``"mode"`` uses its deterministic mode, matching ``train.py``.
         """
+        if latent_mode not in ("sample", "mode"):
+            raise ValueError(f"Unknown VAE latent mode: {latent_mode}")
+        self.latent_mode = latent_mode
         self.model_path = model_path
         self.vae = AutoencoderKL.from_pretrained(self.model_path)
 
@@ -90,7 +96,10 @@ class VAE():
         """
         with torch.no_grad():
             init_latent_dist = self.vae.encode(image.to(self.vae.dtype)).latent_dist
-        init_latents = self.scaling_factor * init_latent_dist.sample()
+        if self.latent_mode == "mode":
+            init_latents = self.scaling_factor * init_latent_dist.mode()
+        else:
+            init_latents = self.scaling_factor * init_latent_dist.sample()
         return init_latents
     
     def decode_latents(self, latents):

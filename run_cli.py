@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import tempfile
 import yaml
 import subprocess
 
@@ -86,6 +87,27 @@ def main():
     parser.add_argument("--close_mouth_end", type=parse_bool, default=False, help="Close mouth during trailing silence (true/false)")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for inference")
     parser.add_argument("--use_float16", action="store_true", help="Use float16 for lower GPU memory usage")
+    # Clarity options. The first four defaults were adopted after 4K A/B runs on
+    # an RTX 5070; pass the legacy values to reproduce the previous output.
+    parser.add_argument("--vae_latent_mode", type=str, default="mode", choices=["sample", "mode"],
+                        help="VAE encoding: 'mode' (deterministic, matches training) or 'sample' (legacy)")
+    parser.add_argument("--paste_interpolation", type=str, default="lanczos", choices=["linear", "lanczos"],
+                        help="Resize when pasting the generated face back: 'lanczos' or 'linear' (legacy)")
+    parser.add_argument("--enhance_mode", type=str, default="usm", choices=["none", "usm"],
+                        help="Lip clarity enhancement: 'usm' or 'none' (legacy)")
+    parser.add_argument("--usm_amount", type=float, default=-1.0,
+                        help="Unsharp-mask amount; negative selects it automatically")
+    parser.add_argument("--fix_teeth_whiteness", type=parse_bool, default=False,
+                        help="Tone down over-bright teeth inside the mouth (true/false)")
+    parser.add_argument("--protect_upper_face", type=parse_bool, default=True,
+                        help="Keep exact source pixels above the blend boundary (true/false; legacy false)")
+    parser.add_argument("--close_mouth_pauses", type=parse_bool, default=False,
+                        help="Blend to the neutral mouth during mid-sentence pauses (true/false)")
+    parser.add_argument("--pause_min_frames", type=int, default=8, help="Shortest pause, in frames, that closes the mouth")
+    parser.add_argument("--pause_fade_frames", type=int, default=4, help="Frames used to fade into and out of a pause")
+    parser.add_argument("--pause_top_db", type=float, default=38.0, help="Silence threshold below the audio peak, in dB")
+    parser.add_argument("--use_audio_pe", type=parse_bool, default=True,
+                        help="Add positional encoding to Whisper features (legacy true)")
     
     args = parser.parse_args()
 
@@ -106,9 +128,11 @@ def main():
         }
     }
     
-    temp_yaml = os.path.abspath("configs/inference/temp_cli_task.yaml")
-    os.makedirs(os.path.dirname(temp_yaml), exist_ok=True)
-    with open(temp_yaml, "w", encoding="utf-8") as f:
+    # 每次调用使用唯一的临时 yaml，避免同一目录下并发任务互相覆盖输入路径
+    temp_yaml_dir = os.path.abspath("configs/inference")
+    os.makedirs(temp_yaml_dir, exist_ok=True)
+    yaml_fd, temp_yaml = tempfile.mkstemp(prefix="temp_cli_task_", suffix=".yaml", dir=temp_yaml_dir)
+    with os.fdopen(yaml_fd, "w", encoding="utf-8") as f:
         yaml.dump(config_dict, f)
         
     # 提取输出目录
@@ -147,7 +171,18 @@ def main():
         "--bbox_smooth_window", str(args.bbox_smooth_window),
         "--close_mouth_start", str(args.close_mouth_start).lower(),
         "--close_mouth_end", str(args.close_mouth_end).lower(),
-        "--batch_size", str(args.batch_size)
+        "--batch_size", str(args.batch_size),
+        "--vae_latent_mode", args.vae_latent_mode,
+        "--paste_interpolation", args.paste_interpolation,
+        "--enhance_mode", args.enhance_mode,
+        "--usm_amount", str(args.usm_amount),
+        "--fix_teeth_whiteness", str(args.fix_teeth_whiteness).lower(),
+        "--protect_upper_face", str(args.protect_upper_face).lower(),
+        "--close_mouth_pauses", str(args.close_mouth_pauses).lower(),
+        "--pause_min_frames", str(args.pause_min_frames),
+        "--pause_fade_frames", str(args.pause_fade_frames),
+        "--pause_top_db", str(args.pause_top_db),
+        "--use_audio_pe", str(args.use_audio_pe).lower(),
     ]
     if args.use_float16:
         cmd.append("--use_float16")

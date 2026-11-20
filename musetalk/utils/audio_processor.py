@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from einops import rearrange
 from transformers import AutoFeatureExtractor
-from musetalk.utils.audio_utils import ensure_wav, calculate_audio_target_frames
+from musetalk.utils.audio_utils import converted_wav, calculate_audio_target_frames
 
 
 class AudioProcessor:
@@ -16,8 +16,9 @@ class AudioProcessor:
     def get_audio_feature(self, wav_path, start_index=0, weight_dtype=None):
         if not os.path.exists(wav_path):
             return None
-        wav_path_converted = ensure_wav(wav_path)
-        librosa_output, sampling_rate = librosa.load(wav_path_converted, sr=16000)
+        # Decode through a private 16 kHz mono PCM copy so every caller sees the same samples
+        with converted_wav(wav_path) as wav_path_converted:
+            librosa_output, sampling_rate = librosa.load(wav_path_converted, sr=16000)
         assert sampling_rate == 16000
         # Split audio into 30s segments
         segment_length = 30 * sampling_rate

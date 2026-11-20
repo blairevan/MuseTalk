@@ -29,9 +29,12 @@ from musetalk.utils.blending import get_image_prepare_material, get_image_blendi
 from musetalk.utils.mask_utils import adjust_face_box
 from musetalk.utils.utils import load_all_model, get_video_fps, get_file_type
 from musetalk.utils.audio_processor import AudioProcessor
+from musetalk.utils.audio_utils import build_audio_mux_command, parse_bool
+from musetalk.utils.clarity import PASTE_INTERPOLATION_MODES, resize_generated_face
 from musetalk.utils.sequence_utils import build_ping_pong_cycle
 
 import shutil
+import tempfile
 import threading
 import queue
 import time
@@ -89,12 +92,34 @@ class Avatar:
             "avatar_id": avatar_id,
             "video_path": video_path,
             "bbox_shift": bbox_shift,
-            "version": args.version
+            "version": args.version,
+            "mask_blur_ratio": args.mask_blur_ratio,
+            "protect_upper_face": args.protect_upper_face,
+            "vae_latent_mode": args.vae_latent_mode,
         }
         self.preparation = preparation
         self.batch_size = batch_size
         self.idx = 0
         self.init()
+
+    def warn_on_cached_settings(self, cached_info):
+        """Warn when a reused avatar was prepared with different mask or latent settings.
+
+        Args:
+            cached_info (dict): ``avator_info.json`` written at preparation time.
+                Keys missing in older caches are treated as the legacy values.
+        """
+        for cache_key, legacy_value in (
+            ("mask_blur_ratio", 0.1),
+            ("protect_upper_face", False),
+            ("vae_latent_mode", "sample"),
+        ):
+            if cached_info.get(cache_key, legacy_value) != self.avatar_info[cache_key]:
+                print(
+                    f"Warning: the cached avatar was prepared with {cache_key}="
+                    f"{cached_info.get(cache_key, legacy_value)}; re-create the avatar to apply "
+                    f"{self.avatar_info[cache_key]}"
+                )
 
     def init(self):
         if self.preparation:
@@ -108,6 +133,9 @@ class Avatar:
                     osmakedirs([self.avatar_path, self.full_imgs_path, self.video_out_path, self.mask_out_path])
                     self.prepare_material()
                 else:
+                    if os.path.exists(self.avatar_info_path):
+                        with open(self.avatar_info_path, "r") as f:
+                            self.warn_on_cached_settings(json.load(f))
                     self.input_latent_list_cycle = torch.load(self.latents_out_path, weights_only=False)
                     with open(self.coords_path, 'rb') as f:
                         self.coord_list_cycle = pickle.load(f)
@@ -132,6 +160,8 @@ class Avatar:
 
             with open(self.avatar_info_path, "r") as f:
                 avatar_info = json.load(f)
+
+            self.warn_on_cached_settings(avatar_info)
 
             if avatar_info['bbox_shift'] != self.avatar_info['bbox_shift']:
                 response = input(f" 【bbox_shift】 is changed, you need to re-create it ! (c/continue)")
@@ -264,7 +294,9 @@ class Avatar:
                 [x1, y1, x2, y2],
                 fp=fp,
                 mode=mode,
-                side_protect_ratio=args.side_protect_ratio if args.version == "v15" else 0.0
+                side_protect_ratio=args.side_protect_ratio if args.version == "v15" else 0.0,
+                blur_ratio=args.mask_blur_ratio,
+                protect_upper_face=args.protect_upper_face,
             )
 
             cv2.imwrite(f"{self.mask_out_path}/{str(i).zfill(8)}.png", mask)
@@ -298,15 +330,17 @@ class Avatar:
             # If coordinates are invalid, save original frame to maintain sequence continuity
             if bbox == coord_placeholder or (x2 - x1) <= 0 or (y2 - y1) <= 0:
                 if skip_save_images is False:
-                    cv2.imwrite(f"{self.avatar_path}/tmp/{str(self.idx).zfill(8)}.png", ori_frame)
+                    cv2.imwrite(f"{self.tmp_dir}/{str(self.idx).zfill(8)}.png", ori_frame)
                 self.idx = self.idx + 1
                 continue
                 
             try:
-                res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
+                res_frame = resize_generated_face(
+                    res_frame, x2 - x1, y2 - y1, mode=args.paste_interpolation
+                )
             except Exception as e:
                 if skip_save_images is False:
-                    cv2.imwrite(f"{self.avatar_path}/tmp/{str(self.idx).zfill(8)}.png", ori_frame)
+                    cv2.imwrite(f"{self.tmp_dir}/{str(self.idx).zfill(8)}.png", ori_frame)
                 self.idx = self.idx + 1
                 continue
                 
@@ -316,16 +350,19 @@ class Avatar:
             try:
                 combine_frame = get_image_blending(ori_frame, res_frame, bbox, mask, mask_crop_box)
                 if skip_save_images is False:
-                    cv2.imwrite(f"{self.avatar_path}/tmp/{str(self.idx).zfill(8)}.png", combine_frame)
+                    cv2.imwrite(f"{self.tmp_dir}/{str(self.idx).zfill(8)}.png", combine_frame)
             except Exception as e:
                 if skip_save_images is False:
-                    cv2.imwrite(f"{self.avatar_path}/tmp/{str(self.idx).zfill(8)}.png", ori_frame)
+                    cv2.imwrite(f"{self.tmp_dir}/{str(self.idx).zfill(8)}.png", ori_frame)
                     
             self.idx = self.idx + 1
 
     @torch.no_grad()
     def inference(self, audio_path, out_vid_name, fps, skip_save_images):
-        os.makedirs(self.avatar_path + '/tmp', exist_ok=True)
+        # Each call writes frames and the silent video into its own directory in
+        # the system temp area, outside the avatar cache, so earlier or concurrent
+        # tasks (and an avatar re-creation in another process) cannot touch it
+        self.tmp_dir = tempfile.mkdtemp(prefix=f"musetalk_rt_{self.avatar_id}_")
         print("start inference")
         ############################################## extract audio feature ##############################################
         start_time = time.time()
@@ -357,7 +394,8 @@ class Avatar:
         res_frame_list = []
 
         for i, (whisper_batch, latent_batch) in enumerate(tqdm(gen, total=int(np.ceil(float(video_num) / self.batch_size)))):
-            audio_feature_batch = pe(whisper_batch.to(device))
+            whisper_batch = whisper_batch.to(device)
+            audio_feature_batch = pe(whisper_batch) if args.use_audio_pe else whisper_batch
             latent_batch = latent_batch.to(device=device, dtype=unet.model.dtype)
 
             pred_latents = unet.model(latent_batch,
@@ -381,18 +419,28 @@ class Avatar:
 
         if out_vid_name is not None and args.skip_save_images is False:
             # optional
-            cmd_img2video = f"ffmpeg -y -v warning -r {fps} -f image2 -i {self.avatar_path}/tmp/%08d.png -vcodec libx264 -vf format=yuv420p -crf 18 {self.avatar_path}/temp.mp4"
+            temp_video = os.path.join(self.tmp_dir, "temp.mp4")
+            cmd_img2video = f"ffmpeg -y -v warning -r {fps} -f image2 -i {self.tmp_dir}/%08d.png -vcodec libx264 -vf format=yuv420p -crf 18 {temp_video}"
             print(cmd_img2video)
-            os.system(cmd_img2video)
+            if os.system(cmd_img2video) != 0:
+                raise RuntimeError(f"Frame encoding failed; frames kept in {self.tmp_dir}")
 
             output_vid = os.path.join(self.video_out_path, out_vid_name + ".mp4")  # on
-            cmd_combine_audio = f"ffmpeg -y -v warning -i {audio_path} -i {self.avatar_path}/temp.mp4 {output_vid}"
-            print(cmd_combine_audio)
-            os.system(cmd_combine_audio)
+            cmd_combine_audio = build_audio_mux_command(audio_path, temp_video, output_vid)
+            print("Audio combination command:", cmd_combine_audio)
+            mux_result = subprocess.run(cmd_combine_audio)
+            if mux_result.returncode != 0:
+                # Keep this task's frames and temp.mp4 for inspection
+                raise RuntimeError(
+                    f"Audio mux failed with exit code {mux_result.returncode}; "
+                    f"intermediate files kept in {self.tmp_dir}"
+                )
 
-            os.remove(f"{self.avatar_path}/temp.mp4")
-            shutil.rmtree(f"{self.avatar_path}/tmp")
+            shutil.rmtree(self.tmp_dir)
             print(f"result is save to {output_vid}")
+        elif os.path.isdir(self.tmp_dir):
+            # Frames are not encoded in this mode; drop this task's directory
+            shutil.rmtree(self.tmp_dir)
         print("\n")
 
 
@@ -433,6 +481,17 @@ if __name__ == "__main__":
                        action="store_true",
                        help="Whether skip saving images for better generation speed calculation",
                        )
+    # Opt-in clarity options; every default reproduces the legacy output.
+    parser.add_argument("--vae_latent_mode", type=str, default="sample", choices=["sample", "mode"],
+                        help="VAE encoding: 'sample' (legacy) or 'mode' (deterministic, matches training)")
+    parser.add_argument("--paste_interpolation", type=str, default="linear", choices=list(PASTE_INTERPOLATION_MODES),
+                        help="Resize when pasting the generated face: 'linear' (legacy) or 'lanczos'")
+    parser.add_argument("--mask_blur_ratio", type=float, default=0.1,
+                        help="Mask feather ratio for prepared avatars; legacy realtime 0.1, offline path uses 0.05")
+    parser.add_argument("--protect_upper_face", type=parse_bool, default=False,
+                        help="Keep exact source pixels above the blend boundary (true/false); needs re-preparation")
+    parser.add_argument("--use_audio_pe", type=parse_bool, default=True,
+                        help="Add positional encoding to Whisper features (legacy true)")
 
     args = parser.parse_args()
 
@@ -453,7 +512,8 @@ if __name__ == "__main__":
         unet_model_path=args.unet_model_path,
         vae_type=args.vae_type,
         unet_config=args.unet_config,
-        device=device
+        device=device,
+        vae_latent_mode=args.vae_latent_mode,
     )
     timesteps = torch.tensor([0], device=device)
 

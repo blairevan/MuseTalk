@@ -75,9 +75,51 @@ These parameters affect how the generated mouth area is blended back into the or
 
 ---
 
+### 5. Clarity & Pause Options (清晰度与停顿选项)
+
+The first four options below are **on by default** since 2026-11-20, after 4K A/B runs on an RTX 5070 (lip sharpness +13% to +24%, no extra run time, upper face and glasses untouched). Pass the legacy value to reproduce the previous output. The remaining options stay off. (前四项自 2026-11-20 起默认开启，依据为 RTX 5070 上两条 4K 底板的 A/B：唇部锐度提升 13%~24%、耗时不变、上半脸与镜框不受影响。如需旧版输出，传入括号内的旧值；其余选项仍默认关闭。)
+
+| Argument (参数名) | Type (类型) | Default (默认值) | Description (说明) |
+| :--- | :--- | :--- | :--- |
+| `--vae_latent_mode` | `str` | `"mode"` | `mode` is deterministic and matches training; legacy `sample` draws from the VAE posterior. (VAE 编码方式，旧值 `sample`) |
+| `--paste_interpolation` | `str` | `"lanczos"` | `lanczos`: area when shrinking, Lanczos when enlarging; legacy `linear`. (回贴缩放插值，旧值 `linear`) |
+| `--enhance_mode` | `str` | `"usm"` | `usm` sharpens the lip area on the luma channel; legacy `none`. (唇齿局部锐化，旧值 `none`) |
+| `--protect_upper_face` | `bool` | `true` | Keep exact source pixels above the blend boundary; legacy `false`. (上半脸严格保持原帧像素，旧值 `false`) |
+| `--usm_amount` | `float` | `-1.0` | Sharpening amount; negative picks it from how much the face is enlarged. (锐化强度，负数为自动) |
+| `--fix_teeth_whiteness` | `bool` | `false` | Tone down over-bright teeth inside the parsed mouth interior; about +5% run time. (嘴内亮区修正，耗时约 +5%) |
+| `--close_mouth_pauses` | `bool` | `false` | Fade to the neutral (first-frame) mouth during mid-sentence pauses. Known issue: the chin shifts when the speaker's head has moved since frame 0. (句中停顿渐变闭嘴；已知问题：讲者头部相对第 0 帧有移动时下巴会错位) |
+| `--pause_min_frames` | `int` | `8` | Shortest pause, in frames, that closes the mouth. (触发闭嘴的最短停顿帧数) |
+| `--pause_fade_frames` | `int` | `4` | Frames used for each fade in and out. (渐入、渐出各用的帧数) |
+| `--pause_top_db` | `float` | `38.0` | Silence threshold below the audio peak, in dB; raise it for audio with background noise or music. (停顿检测门限，相对峰值的分贝数；有底噪或背景音乐时调大) |
+| `--use_audio_pe` | `bool` | `true` | Add positional encoding to Whisper features (legacy). Use `false` only for the PE A/B. (音频位置编码；仅为 A/B 设 false) |
+
+Reproduce the previous (pre-2026-11-20) output (复现旧版输出):
+
+```bash
+python run_cli.py --face ./data/video/select_ref.mp4 --audio ./data/audio/monalisa.wav \
+  --outfile ./output/result_legacy.mp4 \
+  --vae_latent_mode sample --paste_interpolation linear --enhance_mode none \
+  --protect_upper_face false
+```
+
+The final audio mux now copies the rendered video stream instead of re-encoding it, so the output keeps the single CRF 18 encode; files are larger than before. (合音轨改为直接拷贝视频流，避免二次有损编码；输出文件会比之前大。)
+
+---
+
 ## ⚙️ How it works internally (内部运行机制)
 
 1. **Input Validation**: It validates whether the face and audio paths exist, and checks for unsupported files.
-2. **Auto YAML Generation**: It generates a temporary yaml task file at `configs/inference/temp_cli_task.yaml`.
+2. **Auto YAML Generation**: It generates a private temporary task file `configs/inference/temp_cli_task_*.yaml` (unique per run, so concurrent runs do not overwrite each other).
 3. **Task Launching**: It invokes the underlying inference script `scripts.inference` with the designated weights path.
 4. **Cleanup**: Finally, it automatically cleans up the generated temporary configurations.
+
+---
+
+## 修订记录
+
+| 修订时间 | 修订摘要 |
+| --- | --- |
+| 2026-11-19 21:48:00 +08:00 | 新增第 5 节：记录清晰度与句中停顿相关的 10 个参数（默认值均保持旧版输出）及全开对照示例。此前版本无修订记录。 |
+| 2026-11-20 17:20:00 +08:00 | 依据 RTX 5070 两条 4K 底板 A/B 结果，将 `vae_latent_mode`、`paste_interpolation`、`enhance_mode`、`protect_upper_face` 改为默认开启；补充旧版复现命令、`close_mouth_pauses` 已知问题，以及合音轨改为拷贝视频流的说明。 |
+| 2026-11-20 17:33:00 +08:00 | 新增 `--pause_top_db` 参数说明（此前底层脚本支持但包装入口未透传）。实测输出视频码率约由 2.5 Mbps 升至 4.6 Mbps（4K、58 s 样例文件 18.6 MB → 34.4 MB），系去掉二次编码所致。 |
+| 2026-11-20 17:52:00 +08:00 | “内部运行机制”更新：每次运行使用唯一的临时任务文件 `temp_cli_task_*.yaml`；底层推理默认不再在输出目录的上级写人脸坐标文件（仅 `--saved_coord` 时写入）。 |

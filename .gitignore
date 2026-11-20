@@ -18,4 +18,6 @@ exp_out
 .gradio
 .playwright-mcp/
 /HANDOFF.md
+/docs/zeroshot-clarity-optimization-plan.md
 /.superpowers/
+configs/inference/temp_cli_task*.yaml
