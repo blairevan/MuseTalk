@@ -1,0 +1,93 @@
+# Pilot 2A: adapt the v1.5 UNet to 512x512 crops (L1 + VGG only).
+# Run only after verifying train/val DataLoader batches use distinct speaker splits.
+exp_name: 'pilot'
+output_dir: './exp_out/stage2a_512_pilot/'
+unet_sub_folder: musetalkV15
+unet_config_path: "./models/musetalkV15/musetalk.json"  # v1.5 UNet structure
+pretrained_unet_path: "./models/musetalkV15/unet.pth"  # warm start from v1.5 weights
+random_init_unet: False
+whisper_path: "./models/whisper"
+pretrained_model_name_or_path: "./models"
+resume_from_checkpoint: False  # set True only to resume this run's own checkpoint-* dirs
+save_training_state: True  # also write checkpoint-* with optimizer/scheduler/RNG state
+use_audio_pe: False  # decide via inference PE A/B before changing
+padding_pixel_mouth: 10
+vae_type: "sd-vae"
+num_images_to_keep: 8
+ref_dropout_rate: 0
+syncnet_config_path: "./configs/training/syncnet.yaml"
+use_adapted_weight: False
+cropping_jaw2edge_margin_mean: 10
+cropping_jaw2edge_margin_std: 10
+crop_type: "dynamic_margin_crop_resize"
+random_margin_method: "normal"
+num_backward_frames: 1
+
+data:
+  dataset_key: "HDTF"
+  train_list: "./dataset/HDTF/train.txt"
+  val_list: "./dataset/HDTF/val.txt"
+  train_bs: 4  # start small; raise after measuring peak memory
+  image_size: 512
+  n_sample_frames: 1
+  num_workers: 4
+  audio_padding_length_left: 2
+  audio_padding_length_right: 2
+  sample_method: pose_similarity_and_mouth_dissimilarity
+  top_k_ratio: 0.51
+  contorl_face_min_size: True
+  min_face_size: 512  # must not exceed image_size
+
+loss_params:
+  l1_loss: 1.0
+  vgg_loss: 0.01
+  vgg_layer_weight: [1, 1, 1, 1, 1]
+  pyramid_scale: [1, 0.5, 0.25, 0.125]
+  gan_loss: 0
+  fm_loss: [1.0, 1.0, 1.0, 1.0]
+  sync_loss: 0
+  mouth_gan_loss: 0
+
+model_params:
+  discriminator_params:
+    scales: [1]
+    block_expansion: 32
+    max_features: 512
+    num_blocks: 4
+    sn: True
+    image_channel: 3
+    estimate_jacobian: False
+
+discriminator_train_params:
+  lr: 0.000005
+  eps: 0.00000001
+  weight_decay: 0.01
+  patch_size: 1
+  betas: [0.5, 0.999]
+  epochs: 10000
+  start_gan: 1000
+
+solver:
+  gradient_accumulation_steps: 1
+  uncond_steps: 10
+  mixed_precision: 'fp32'
+  enable_xformers_memory_efficient_attention: True
+  gradient_checkpointing: True
+  max_train_steps: 15000  # candidate upper bound, not a target
+  max_grad_norm: 1.0
+  learning_rate: 1.0e-5  # trial value
+  scale_lr: False
+  lr_warmup_steps: 500
+  lr_scheduler: "linear"
+  use_8bit_adam: False
+  adam_beta1: 0.5
+  adam_beta2: 0.999
+  adam_weight_decay: 1.0e-2
+  adam_epsilon: 1.0e-8
+
+total_limit: 3
+save_model_epoch_interval: 250000
+checkpointing_steps: 500
+val_freq: 500
+
+seed: 41

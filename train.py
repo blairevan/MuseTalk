@@ -17,6 +17,8 @@ from accelerate.utils import LoggerType
 from accelerate import InitProcessGroupKwargs
 from accelerate.logging import get_logger
 from accelerate.utils import DistributedDataParallelKwargs
+from accelerate.utils import DistributedType
+from accelerate.utils import broadcast_object_list
 from datetime import datetime
 from datetime import timedelta
 
@@ -34,7 +36,19 @@ from musetalk.utils.utils import (
 )
 from musetalk.loss.basic_loss import set_requires_grad
 from musetalk.loss.syncnet import get_sync_loss
+from musetalk.utils.checkpoint_utils import (
+    acquire_experiment_lock,
+    clear_staging_dirs,
+    publish_checkpoint,
+    restore_retired_checkpoints,
+    should_load_custom_checkpoints,
+    staging_checkpoint_dir,
+    validate_resumable_interval,
+    validate_resume_step,
+)
+from musetalk.utils.train_schedule import validate_deepspeed_gan_config
 from musetalk.utils.training_utils import (
+    apply_audio_pe,
     initialize_models_and_optimizers,
     initialize_dataloaders,
     initialize_loss_functions,
@@ -46,6 +60,97 @@ from musetalk.utils.training_utils import (
 logger = get_logger(__name__, log_level="INFO")
 warnings.filterwarnings("ignore")
 check_min_version("0.10.0.dev0")
+
+# Lower-face input size expected by the LatentSync SyncNet (H, W)
+SYNCNET_LOWER_FACE_SIZE = (128, 256)
+
+
+def resize_for_syncnet(frames):
+    """Resize stacked lower-face frames to the SyncNet input size.
+
+    Args:
+        frames (torch.Tensor): ``(B, F*C, H, W)`` lower halves of the faces.
+
+    Returns:
+        torch.Tensor: Frames at ``SYNCNET_LOWER_FACE_SIZE``; gradients flow
+        through the interpolation for predicted frames.
+    """
+    if tuple(frames.shape[-2:]) == SYNCNET_LOWER_FACE_SIZE:
+        return frames
+    return F.interpolate(frames, size=SYNCNET_LOWER_FACE_SIZE, mode="bilinear", align_corners=False)
+
+
+def _run_on_main_and_share_errors(accelerator, action):
+    """Run ``action`` on the main process and raise its error on every process.
+
+    Keeps all processes on the same code path: either every process continues
+    or every process raises, instead of the main process leaving a barrier
+    that the others are still waiting on.
+
+    Args:
+        accelerator (Accelerator): Training accelerator.
+        action (Callable[[], None]): Filesystem work done once on the main process.
+
+    Raises:
+        RuntimeError: On every process if ``action`` failed on the main process.
+    """
+    status = [None]
+    if accelerator.is_main_process:
+        try:
+            action()
+        except Exception as error:  # broadcast any failure so no process hangs
+            status[0] = f"{type(error).__name__}: {error}"
+    broadcast_object_list(status, from_process=0)
+    if status[0] is not None:
+        raise RuntimeError(f"Checkpoint filesystem step failed on the main process: {status[0]}")
+
+
+def _raise_if_any_process_failed(accelerator, local_error):
+    """Raise on every process if any process reported an error for a collective step.
+
+    Args:
+        accelerator (Accelerator): Training accelerator.
+        local_error (str | None): This process's error message, or ``None``.
+
+    Raises:
+        RuntimeError: On every process if at least one process failed.
+    """
+    flags = accelerator.gather(
+        torch.tensor([0 if local_error is None else 1], device=accelerator.device)
+    )
+    if int(flags.sum().item()) > 0:
+        detail = f": {local_error}" if local_error else " on another process"
+        raise RuntimeError(f"Checkpoint write failed{detail}")
+
+
+def save_resumable_state(accelerator, save_dir, step):
+    """Write the full training state to ``checkpoint-<step>`` without exposing partial writes.
+
+    Every process calls ``save_state`` into a staging directory; the main
+    process renames it once all processes are done, so the resume logic only
+    ever sees complete checkpoints. A failure on any process, in ``save_state``
+    or in the main-process filesystem steps, is raised on every process so all
+    processes leave this function on the same path.
+
+    Args:
+        accelerator (Accelerator): Training accelerator.
+        save_dir (str): Experiment output directory.
+        step (int): Global step used in the directory name.
+
+    Returns:
+        str: Published checkpoint path.
+    """
+    final_path = os.path.join(save_dir, f"checkpoint-{step}")
+    staging_path = staging_checkpoint_dir(save_dir, step)
+    _run_on_main_and_share_errors(accelerator, lambda: clear_staging_dirs(save_dir))
+    local_error = None
+    try:
+        accelerator.save_state(staging_path)
+    except Exception as error:  # reported to every process below
+        local_error = f"{type(error).__name__}: {error}"
+    _raise_if_any_process_failed(accelerator, local_error)
+    _run_on_main_and_share_errors(accelerator, lambda: publish_checkpoint(staging_path, final_path))
+    return final_path
 
 def main(cfg):
     exp_name = cfg.exp_name
@@ -60,6 +165,19 @@ def main(cfg):
         log_with=["tensorboard", LoggerType.TENSORBOARD],
         project_dir=os.path.join(save_dir, "./tensorboard"),
         kwargs_handlers=[kwargs, process_group_kwargs],
+    )
+    validate_deepspeed_gan_config(
+        accelerator.distributed_type == DistributedType.DEEPSPEED,
+        cfg.loss_params.gan_loss,
+        cfg.loss_params.mouth_gan_loss,
+    )
+
+    # One training job per experiment directory: a second job would delete this
+    # job's staging checkpoints and overwrite its weights. The main process holds
+    # the lock for the lifetime of the job; every process fails if it is taken.
+    experiment_lock = []
+    _run_on_main_and_share_errors(
+        accelerator, lambda: experiment_lock.append(acquire_experiment_lock(save_dir))
     )
 
     # Make one log on every process with the configuration for debugging.
@@ -94,13 +212,34 @@ def main(cfg):
         model_dict['net'], model_dict['optimizer'], model_dict['lr_scheduler'], dataloader_dict['train_dataloader'], dataloader_dict['val_dataloader']
     )
     print("length train/val", len(dataloader_dict['train_dataloader']), len(dataloader_dict['val_dataloader']))
+
+    # Discriminators and their optimizers are not prepared; register them so
+    # accelerator.save_state / load_state include them in resumable checkpoints.
+    # Registration is deferred past load_state when resuming a legacy checkpoint
+    # that predates custom discriminator state files.
+    discriminator_checkpoint_objects = [
+        loss_dict[key]
+        for key in (
+            'discriminator', 'optimizer_D', 'scheduler_D',
+            'mouth_discriminator', 'mouth_optimizer_D', 'mouth_scheduler_D',
+        )
+        if loss_dict.get(key) is not None
+    ]
+    discriminators_registered = False
+
+    if cfg.get('use_adapted_weight', False) and cfg.data.train_bs != 1:
+        raise ValueError(
+            "use_adapted_weight only scores the first sample of a batch; set data.train_bs to 1 "
+            "or disable it until per-sample weighting is implemented."
+        )
+    if cfg.get('save_training_state', False):
+        validate_resumable_interval(cfg.checkpointing_steps, cfg.solver.gradient_accumulation_steps)
     
-    # Calculate training steps and epochs
-    num_update_steps_per_epoch = math.ceil(
-        len(dataloader_dict['train_dataloader']) / cfg.solver.gradient_accumulation_steps
-    )
+    # Calculate training steps and epochs. global_step counts micro-steps (one
+    # batch each), so epochs are sized in batches, not optimizer updates.
+    micro_steps_per_epoch = len(dataloader_dict['train_dataloader'])
     num_train_epochs = math.ceil(
-        cfg.solver.max_train_steps / num_update_steps_per_epoch
+        cfg.solver.max_train_steps / micro_steps_per_epoch
     )
 
     # Initialize trackers on the main process
@@ -135,16 +274,46 @@ def main(cfg):
     # Load checkpoint if resuming training
     if cfg.resume_from_checkpoint:
         resume_dir = save_dir
+        # Put back any complete checkpoint left under a retired name by an
+        # interrupted replace before choosing the latest one
+        _run_on_main_and_share_errors(accelerator, lambda: restore_retired_checkpoints(resume_dir))
         dirs = os.listdir(resume_dir)
         dirs = [d for d in dirs if d.startswith("checkpoint")]
         dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
         if len(dirs) > 0:
             path = dirs[-1]
-            accelerator.load_state(os.path.join(resume_dir, path))
+            resume_step_from_name = int(path.split("-")[1])
+            validate_resume_step(resume_step_from_name, cfg.solver.gradient_accumulation_steps)
+            ckpt_path = os.path.join(resume_dir, path)
+            if should_load_custom_checkpoints(ckpt_path, len(discriminator_checkpoint_objects)):
+                for obj in discriminator_checkpoint_objects:
+                    accelerator.register_for_checkpointing(obj)
+                discriminators_registered = True
+            else:
+                logger.warning(
+                    "Legacy checkpoint %s has no discriminator state; resuming generator only "
+                    "and keeping freshly initialized discriminators.",
+                    ckpt_path,
+                )
+            accelerator.load_state(ckpt_path)
             accelerator.print(f"Resuming from checkpoint {path}")
-            global_step = int(path.split("-")[1])
-            first_epoch = global_step // num_update_steps_per_epoch
-            resume_step = global_step % num_update_steps_per_epoch
+            global_step = resume_step_from_name
+            first_epoch = global_step // micro_steps_per_epoch
+            # Batches are drawn at random (FaceDataset ignores the index), so the
+            # data position is not replayed; model, optimizer, scheduler and RNG
+            # state are restored, and checkpoints sit on accumulation boundaries.
+
+    if not discriminators_registered:
+        for obj in discriminator_checkpoint_objects:
+            accelerator.register_for_checkpointing(obj)
+        discriminators_registered = True
+
+    if global_step >= cfg.solver.max_train_steps:
+        # A finished run must not take another batch or optimizer step
+        accelerator.print(
+            f"global_step {global_step} already reached max_train_steps {cfg.solver.max_train_steps}; nothing to train"
+        )
+        num_train_epochs = first_epoch
 
     # Initialize progress bar
     progress_bar = tqdm(
@@ -223,13 +392,14 @@ def main(cfg):
                     # Use lower half of face for latentsync
                     height = gt_frames.shape[2]
                     gt_frames = gt_frames[:, :, height // 2:, :]
+                    gt_frames = resize_for_syncnet(gt_frames)
                     
                     # Get audio embeddings
                     audio_embed = syncnet.get_audio_embed(mels)
                     
                     # Calculate adapted weight based on audio-visual similarity
                     if cfg.use_adapted_weight:
-                        vision_embed_gt = syncnet.get_vision_embed(gt_frames)
+                        vision_embed_gt = syncnet.get_image_embed(gt_frames)
                         image_audio_sim_gt = F.cosine_similarity(
                             audio_embed, 
                             vision_embed_gt, 
@@ -295,6 +465,7 @@ def main(cfg):
                     '(b f) c h w -> (b f) (c h) w', 
                     b=bsz
                 )
+                audio_prompts_backward = apply_audio_pe(audio_prompts_backward, model_dict['audio_pe'])
 
             # Apply reference dropout (currently inactive)
             dropout = nn.Dropout(p=cfg.ref_dropout_rate)
@@ -406,6 +577,7 @@ def main(cfg):
                 pred_frames = rearrange(
                     image_pred, '(b f) c h w-> b (f c) h w', f=pixel_values_backward.shape[1])
                 pred_frames = pred_frames[:, :, height // 2 :, :]
+                pred_frames = resize_for_syncnet(pred_frames)
                 sync_loss, image_audio_sim_pred = get_sync_loss(
                     audio_embed, 
                     gt_frames, 
@@ -432,10 +604,10 @@ def main(cfg):
                 loss_D = loss_D * get_ganloss_weight(global_step) * adapted_weight
                 accelerator.backward(loss_D)
                 
-                if accelerator.sync_gradients:
+                # Clip and step only once the accumulated gradient is complete
+                if (global_step + 1) % cfg.solver.gradient_accumulation_steps == 0:
                     accelerator.clip_grad_norm_(
                         loss_dict['discriminator'].parameters(), cfg.solver.max_grad_norm)
-                if (global_step + 1) % cfg.solver.gradient_accumulation_steps == 0:
                     loss_dict['optimizer_D'].step()
                     loss_dict['scheduler_D'].step()
                     loss_dict['optimizer_D'].zero_grad()
@@ -451,10 +623,10 @@ def main(cfg):
                 mouth_loss_D = mouth_loss_D * get_ganloss_weight(global_step) * adapted_weight
                 accelerator.backward(mouth_loss_D)
                 
-                if accelerator.sync_gradients:
+                # Clip and step only once the accumulated gradient is complete
+                if (global_step + 1) % cfg.solver.gradient_accumulation_steps == 0:
                     accelerator.clip_grad_norm_(
                         loss_dict['mouth_discriminator'].parameters(), cfg.solver.max_grad_norm)
-                if (global_step + 1) % cfg.solver.gradient_accumulation_steps == 0:
                     loss_dict['mouth_optimizer_D'].step()
                     loss_dict['mouth_scheduler_D'].step()
                     loss_dict['mouth_optimizer_D'].zero_grad()
@@ -512,15 +684,19 @@ def main(cfg):
                             global_step,
                             weight_dtype,
                             syncnet_score=adapted_weight,
+                            audio_pe=model_dict['audio_pe'],
                         )
                     except Exception as e:
                         print(f"An error occurred during validation: {e}")
 
                 # Save checkpoint if needed
                 if global_step % cfg.checkpointing_steps == 0:
-                    save_path = os.path.join(save_dir, f"checkpoint-{global_step}")
                     try:
                         start_time = time.time()
+                        # Full state (models, optimizers, schedulers, RNG) for resuming,
+                        # published only once completely written.
+                        if cfg.get('save_training_state', False):
+                            save_resumable_state(accelerator, save_dir, global_step)
                         if accelerator.is_main_process:
                             save_models(
                                 accelerator, 
@@ -557,9 +733,25 @@ def main(cfg):
         if (epoch + 1) % cfg.save_model_epoch_interval == 0:
             try:
                 start_time = time.time()
+                # Main-process work is wrapped so its failures reach every process
+                # before any later collective call
+                _run_on_main_and_share_errors(
+                    accelerator,
+                    lambda: save_models(
+                        accelerator, model_dict['net'], save_dir, global_step, cfg, logger=logger
+                    ),
+                )
+                # Resumable state only on an accumulation boundary, through the same
+                # staged publish as step checkpoints, and not twice for one step.
+                # The decision is made once on the main process and broadcast.
+                decision = [False]
                 if accelerator.is_main_process:
-                    save_models(accelerator, model_dict['net'], save_dir, global_step, cfg)
-                    accelerator.save_state(save_path)
+                    already_published = os.path.isdir(os.path.join(save_dir, f"checkpoint-{global_step}"))
+                    on_boundary = global_step % cfg.solver.gradient_accumulation_steps == 0
+                    decision[0] = on_boundary and not already_published
+                broadcast_object_list(decision, from_process=0)
+                if decision[0]:
+                    save_resumable_state(accelerator, save_dir, global_step)
                 elapsed_time = time.time() - start_time
                 if elapsed_time > 120:
                     print(f"Skipping storage as it took too long in step {global_step}.")
@@ -568,6 +760,10 @@ def main(cfg):
             except Exception as e:
                 print(f"Error when saving model in step {global_step}:", e)
         accelerator.wait_for_everyone()
+
+        # Stop instead of starting another epoch once the micro-step budget is used
+        if global_step >= cfg.solver.max_train_steps:
+            break
 
     # End training
     accelerator.end_training()

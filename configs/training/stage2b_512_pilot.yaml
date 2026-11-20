@@ -1,0 +1,94 @@
+# Pilot 2B: sync loss + face/mouth GAN on top of an approved 2A checkpoint.
+# Set pretrained_unet_path to the 2A unet-<step>.pth that passed offline
+# held-out evaluation; training refuses to start while it is missing.
+exp_name: 'pilot'
+output_dir: './exp_out/stage2b_512_pilot/'
+unet_sub_folder: musetalkV15
+unet_config_path: "./models/musetalkV15/musetalk.json"
+pretrained_unet_path: "./exp_out/stage2a_512_pilot/pilot/unet-SET_APPROVED_STEP.pth"
+random_init_unet: False
+whisper_path: "./models/whisper"
+pretrained_model_name_or_path: "./models"
+resume_from_checkpoint: False
+save_training_state: True
+use_audio_pe: False  # keep identical to 2A
+padding_pixel_mouth: 10
+vae_type: "sd-vae"
+num_images_to_keep: 8
+ref_dropout_rate: 0
+syncnet_config_path: "./configs/training/syncnet.yaml"
+use_adapted_weight: False  # requires train_bs 1 and a validated per-sample check
+cropping_jaw2edge_margin_mean: 10
+cropping_jaw2edge_margin_std: 10
+crop_type: "dynamic_margin_crop_resize"
+random_margin_method: "normal"
+num_backward_frames: 16
+
+data:
+  dataset_key: "HDTF"
+  train_list: "./dataset/HDTF/train.txt"
+  val_list: "./dataset/HDTF/val.txt"
+  train_bs: 1
+  image_size: 512
+  n_sample_frames: 16  # required by the sync loss
+  num_workers: 4
+  audio_padding_length_left: 2
+  audio_padding_length_right: 2
+  sample_method: pose_similarity_and_mouth_dissimilarity
+  top_k_ratio: 0.51
+  contorl_face_min_size: True
+  min_face_size: 512
+
+loss_params:
+  l1_loss: 1.0
+  vgg_loss: 0.01
+  vgg_layer_weight: [1, 1, 1, 1, 1]
+  pyramid_scale: [1, 0.5, 0.25, 0.125]
+  gan_loss: 0.01
+  fm_loss: [1.0, 1.0, 1.0, 1.0]
+  sync_loss: 0.05
+  mouth_gan_loss: 0.01
+
+model_params:
+  discriminator_params:
+    scales: [1]
+    block_expansion: 32
+    max_features: 512
+    num_blocks: 4
+    sn: True
+    image_channel: 3
+    estimate_jacobian: False
+
+discriminator_train_params:
+  lr: 0.000005
+  eps: 0.00000001
+  weight_decay: 0.01
+  patch_size: 1
+  betas: [0.5, 0.999]
+  epochs: 10000
+  start_gan: 1000
+
+solver:
+  gradient_accumulation_steps: 1
+  uncond_steps: 10
+  mixed_precision: 'fp32'
+  enable_xformers_memory_efficient_attention: True
+  gradient_checkpointing: True
+  max_train_steps: 25000  # candidate upper bound, not a target
+  max_grad_norm: 1.0
+  learning_rate: 3.0e-6  # trial value
+  scale_lr: False
+  lr_warmup_steps: 500
+  lr_scheduler: "linear"
+  use_8bit_adam: False
+  adam_beta1: 0.5
+  adam_beta2: 0.999
+  adam_weight_decay: 1.0e-2
+  adam_epsilon: 1.0e-8
+
+total_limit: 3
+save_model_epoch_interval: 250000
+checkpointing_steps: 500
+val_freq: 500
+
+seed: 41

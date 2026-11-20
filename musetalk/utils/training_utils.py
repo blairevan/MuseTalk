@@ -12,10 +12,12 @@ from omegaconf import OmegaConf
 from einops import rearrange
 
 from musetalk.models.syncnet import SyncNet
+from musetalk.models.unet import PositionalEncoding
 from musetalk.loss.discriminator import MultiScaleDiscriminator, DiscriminatorFullModel
 from musetalk.loss.basic_loss import Interpolate
 import musetalk.loss.vgg_face as vgg_face
 from musetalk.data.dataset import PortraitDataset
+from musetalk.utils.train_schedule import compute_schedule_steps
 from musetalk.utils.utils import (
     get_image_pred,
     process_audio_features,
@@ -45,6 +47,23 @@ class Net(nn.Module):
 
 logger = logging.getLogger(__name__)
 
+
+def apply_audio_pe(audio_prompts, audio_pe):
+    """Add the inference-time positional encoding to audio prompts when enabled.
+
+    Args:
+        audio_prompts (torch.Tensor): ``(B*T, 50, 384)`` Whisper windows.
+        audio_pe (PositionalEncoding | None): Encoding module, or ``None`` to
+            keep the legacy training behaviour (no encoding).
+
+    Returns:
+        torch.Tensor: Audio prompts for the UNet.
+    """
+    if audio_pe is None:
+        return audio_prompts
+    return audio_pe(audio_prompts)
+
+
 def initialize_models_and_optimizers(cfg, accelerator, weight_dtype):
     """Initialize models and optimizers"""
     model_dict = {
@@ -52,6 +71,7 @@ def initialize_models_and_optimizers(cfg, accelerator, weight_dtype):
         'unet': None,
         'net': None,
         'wav2vec': None,
+        'audio_pe': None,
         'optimizer': None,
         'lr_scheduler': None,
         'scheduler_max_steps': None,
@@ -63,7 +83,7 @@ def initialize_models_and_optimizers(cfg, accelerator, weight_dtype):
         subfolder=cfg.vae_type,
     )
 
-    unet_config_file = os.path.join(
+    unet_config_file = cfg.get('unet_config_path') or os.path.join(
         cfg.pretrained_model_name_or_path, 
         cfg.unet_sub_folder + "/musetalk.json"
     )
@@ -73,10 +93,19 @@ def initialize_models_and_optimizers(cfg, accelerator, weight_dtype):
     model_dict['unet'] = UNet2DConditionModel(**unet_config)
     
     if not cfg.random_init_unet:
-        pretrained_unet_path = os.path.join(cfg.pretrained_model_name_or_path, cfg.unet_sub_folder, "pytorch_model.bin")
+        pretrained_unet_path = cfg.get('pretrained_unet_path') or os.path.join(
+            cfg.pretrained_model_name_or_path, cfg.unet_sub_folder, "pytorch_model.bin"
+        )
+        if not os.path.isfile(pretrained_unet_path):
+            raise FileNotFoundError(f"Pretrained UNet weights not found: {pretrained_unet_path}")
         print(f"### Loading existing unet weights from {pretrained_unet_path}. ###")
-        checkpoint = torch.load(pretrained_unet_path, map_location=accelerator.device, weights_only=False)
-        model_dict['unet'].load_state_dict(checkpoint)
+        # Load on CPU first so the state dict does not double GPU memory
+        checkpoint = torch.load(pretrained_unet_path, map_location="cpu", weights_only=False)
+        model_dict['unet'].load_state_dict(checkpoint, strict=True)
+        del checkpoint
+
+    if cfg.get('use_audio_pe', False):
+        model_dict['audio_pe'] = PositionalEncoding(d_model=384).to(accelerator.device)
       
     unet_params = [p.numel() for n, p in model_dict['unet'].named_parameters()]
     logger.info(f"unet {sum(unet_params) / 1e6}M-parameter")
@@ -131,26 +160,26 @@ def initialize_models_and_optimizers(cfg, accelerator, weight_dtype):
         eps=cfg.solver.adam_epsilon,
     )
 
-    model_dict['scheduler_max_steps'] = cfg.solver.max_train_steps * cfg.solver.gradient_accumulation_steps
+    schedule = compute_schedule_steps(
+        cfg.solver.max_train_steps,
+        cfg.solver.lr_warmup_steps,
+        cfg.solver.gradient_accumulation_steps,
+        accelerator.num_processes,
+    )
+    # Discriminator schedulers are not prepared and step once per optimizer update
+    model_dict['scheduler_max_steps'] = schedule['discriminator_t_max']
     model_dict['lr_scheduler'] = get_scheduler(
         cfg.solver.lr_scheduler,
         optimizer=model_dict['optimizer'],
-        num_warmup_steps=cfg.solver.lr_warmup_steps * cfg.solver.gradient_accumulation_steps,
-        num_training_steps=model_dict['scheduler_max_steps'],
+        num_warmup_steps=schedule['scheduler_warmup_steps'],
+        num_training_steps=schedule['scheduler_total_steps'],
     )
 
     return model_dict
 
-def initialize_dataloaders(cfg):
-    """Initialize training and validation dataloaders"""
-    dataloader_dict = {
-        'train_dataset': None,
-        'val_dataset': None,
-        'train_dataloader': None,
-        'val_dataloader': None
-    }
-    
-    dataloader_dict['train_dataset'] = PortraitDataset(cfg={
+def _dataset_cfg(cfg):
+    """Collect the dataset options shared by the train and validation splits."""
+    return {
         'image_size': cfg.data.image_size,
         'T': cfg.data.n_sample_frames,
         "sample_method": cfg.data.sample_method,
@@ -164,7 +193,25 @@ def initialize_dataloaders(cfg):
         "cropping_jaw2edge_margin_std": cfg.cropping_jaw2edge_margin_std,
         "crop_type": cfg.crop_type,
         "random_margin_method": cfg.random_margin_method,
-    })
+        "train_list": cfg.data.get('train_list'),
+        "val_list": cfg.data.get('val_list'),
+    }
+
+
+def initialize_dataloaders(cfg):
+    """Initialize training and validation dataloaders.
+
+    The training split samples randomly from ``train_list``; the validation
+    split reads ``val_list`` in a fixed order with fixed windows.
+    """
+    dataloader_dict = {
+        'train_dataset': None,
+        'val_dataset': None,
+        'train_dataloader': None,
+        'val_dataloader': None
+    }
+
+    dataloader_dict['train_dataset'] = PortraitDataset(cfg=_dataset_cfg(cfg), split="train")
 
     dataloader_dict['train_dataloader'] = torch.utils.data.DataLoader(
         dataloader_dict['train_dataset'],
@@ -173,26 +220,12 @@ def initialize_dataloaders(cfg):
         num_workers=cfg.data.num_workers,
     )
     
-    dataloader_dict['val_dataset'] = PortraitDataset(cfg={
-        'image_size': cfg.data.image_size,
-        'T': cfg.data.n_sample_frames,
-        "sample_method": cfg.data.sample_method,
-        'top_k_ratio': cfg.data.top_k_ratio,
-        "contorl_face_min_size": cfg.data.contorl_face_min_size,
-        "dataset_key": cfg.data.dataset_key,
-        "padding_pixel_mouth": cfg.padding_pixel_mouth,
-        "whisper_path": cfg.whisper_path,
-        "min_face_size": cfg.data.min_face_size,
-        "cropping_jaw2edge_margin_mean": cfg.cropping_jaw2edge_margin_mean,
-        "cropping_jaw2edge_margin_std": cfg.cropping_jaw2edge_margin_std,
-        "crop_type": cfg.crop_type,
-        "random_margin_method": cfg.random_margin_method,
-    })
+    dataloader_dict['val_dataset'] = PortraitDataset(cfg=_dataset_cfg(cfg), split="val")
 
     dataloader_dict['val_dataloader'] = torch.utils.data.DataLoader(
         dataloader_dict['val_dataset'],
         batch_size=cfg.data.train_bs,
-        shuffle=True,
+        shuffle=False,
         num_workers=1,
     )
     
@@ -261,7 +294,7 @@ def initialize_syncnet(cfg, accelerator, weight_dtype):
         print(
             f"Load SyncNet checkpoint from: {syncnet_config.ckpt.inference_ckpt_path}")
         checkpoint = torch.load(
-            os.path.join(vae_path, 'diffusion_pytorch_model.bin'), map_location=accelerator.device, weights_only=False
+            syncnet_config.ckpt.inference_ckpt_path, map_location="cpu", weights_only=False
         )
         syncnet.load_state_dict(checkpoint["state_dict"])
         syncnet.to(dtype=weight_dtype)
@@ -293,8 +326,13 @@ def validation(
     global_step,
     weight_dtype,
     syncnet_score=1,
+    audio_pe=None,
 ):
-    """Validation function for model evaluation"""
+    """Save one validation sample grid (no metrics are computed here).
+
+    Args:
+        audio_pe (PositionalEncoding | None): Same encoding used in training.
+    """
     net.eval()  # Set the model to evaluation mode
     for batch in val_dataloader:
         # The same ref_latents
@@ -317,6 +355,7 @@ def validation(
             '(b f) c h w -> (b f) (c h) w', 
             b=bsz
         )
+        audio_prompts = apply_audio_pe(audio_prompts, audio_pe)
         # different masked_latents
         image_pred_train = get_image_pred(
             pixel_values, ref_pixel_values, audio_prompts, vae, net, weight_dtype)

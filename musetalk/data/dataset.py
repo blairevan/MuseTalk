@@ -15,7 +15,14 @@ from decord.ndarray import cpu
 
 from musetalk.data.sample_method import get_src_idx, shift_landmarks_to_face_coordinates, resize_landmark 
 from musetalk.data import audio 
-from musetalk.utils.audio_utils import ensure_wav
+from musetalk.data.data_utils import (
+    check_face_size_config,
+    mouth_mask_bounds,
+    read_meta_list,
+    seeded_random_state,
+    whisper_window,
+)
+from musetalk.utils.audio_utils import converted_wav
 
 syncnet_mel_step_size = math.ceil(16 / 5 * 16)  # latentsync
 
@@ -32,28 +39,35 @@ class FaceDataset(Dataset):
                  cfg,
                  list_paths,
                  root_path='./dataset/',
-                 repeats=None):
+                 repeats=None,
+                 deterministic=False,
+                 seed_base=0):
+        """
+        Args:
+            deterministic (bool): When true, ``idx`` selects the clip and a
+                per-index seed fixes the frame window, so validation batches are
+                identical across training steps.
+            seed_base (int): Offset added to ``idx`` for the per-index seed.
+        """
         # Initialize dataset paths
         meta_paths = []
         if repeats is None:
             repeats = [1] * len(list_paths)
         assert len(repeats) == len(list_paths)
         
-        # Load data list
+        # Load data list (header-less, as written by scripts/preprocess.py)
         for list_path, repeat_time in zip(list_paths, repeats):
-            with open(list_path, 'r') as f:
-                num = 0
-                f.readline()  # Skip header line
-                for line in f.readlines():
-                    line_info = line.strip()
-                    meta = line_info.split()
-                    meta = meta[0]
-                    meta_paths.extend([os.path.join(root_path, meta)] * repeat_time)
-                    num += 1
-                print(f'{list_path}: {num} x {repeat_time} = {num * repeat_time} samples')
+            names = read_meta_list(list_path)
+            for meta in names:
+                meta_paths.extend([os.path.join(root_path, meta)] * repeat_time)
+            print(f'{list_path}: {len(names)} x {repeat_time} = {len(names) * repeat_time} samples')
+        if not meta_paths:
+            raise ValueError(f"No samples found in {list_paths}")
 
         # Set basic attributes
         self.meta_paths = meta_paths
+        self.deterministic = deterministic
+        self.seed_base = int(seed_base)
         self.root_path = root_path
         self.image_size = cfg['image_size']
         self.min_face_size = cfg['min_face_size']
@@ -81,6 +95,7 @@ class FaceDataset(Dataset):
         # Feature extractor
         self.feature_extractor = AutoFeatureExtractor.from_pretrained(cfg['whisper_path'])
         self.contorl_face_min_size = cfg["contorl_face_min_size"]
+        check_face_size_config(self.image_size, self.min_face_size, self.contorl_face_min_size)
         
         print("The sample method is: ", self.sample_method)
         print(f"only use face size > {self.min_face_size}", self.contorl_face_min_size)
@@ -172,18 +187,14 @@ class FaceDataset(Dataset):
         """
         if not os.path.exists(wav_path):
             return None
-        wav_path_converted = ensure_wav(wav_path)
-        audio_input_librosa, sampling_rate = librosa.load(wav_path_converted, sr=16000)
+        with converted_wav(wav_path) as wav_path_converted:
+            audio_input_librosa, sampling_rate = librosa.load(wav_path_converted, sr=16000)
         assert sampling_rate == 16000
 
-        while start_index >= 25 * 30:
-            audio_input = audio_input_librosa[16000*30:]
-            start_index -= 25 * 30
-        if start_index + 2 * 25 >= 25 * 30:
-            start_index -= 4 * 25
-            audio_input = audio_input_librosa[16000*4:16000*34]
-        else:
-            audio_input = audio_input_librosa[:16000*30]
+        # Pick the 30 s window the clip actually falls in (see whisper_window)
+        window_start_seconds, start_index = whisper_window(start_index)
+        window_begin = 16000 * window_start_seconds
+        audio_input = audio_input_librosa[window_begin:window_begin + 16000 * 30]
 
         assert 2 * (start_index) >= 0
         assert 2 * (start_index + 2 * 25) <= 1500
@@ -208,8 +219,8 @@ class FaceDataset(Dataset):
         if not os.path.exists(wav_path):
             return None
 
-        wav_path_converted = ensure_wav(wav_path)
-        audio_input_librosa, sampling_rate = librosa.load(wav_path_converted, sr=16000)
+        with converted_wav(wav_path) as wav_path_converted:
+            audio_input_librosa, sampling_rate = librosa.load(wav_path_converted, sr=16000)
         assert sampling_rate == 16000
 
         audio_mel = self.mel_feature_extractor(audio_input_librosa)
@@ -269,43 +280,37 @@ class FaceDataset(Dataset):
             landmark_array, w=face_shape[0], h=face_shape[1], new_w=image_size, new_h=image_size)
 
         landmark_array = np.array(resized_landmark[48 : 67])  # the lip landmarks in 68 landmarks format
-        min_x, min_y = np.min(landmark_array, axis=0)
-        max_x, max_y = np.max(landmark_array, axis=0)
-        min_x = min_x - padding_pixel_mouth
-        max_x = max_x + padding_pixel_mouth
-
-        # Calculate x-axis length and use it for y-axis
-        width = max_x - min_x
-
-        # Calculate old center point
-        center_y = (max_y + min_y) / 2
-
-        # Determine new min_y and max_y based on width
-        min_y = center_y - width / 4
-        max_y = center_y + width / 4
-
-        # Adjust mask position for dynamic crop, shift y-axis
-        min_y = min_y - crop_margin
-        max_y = max_y - crop_margin
-        
-        # Prevent out of bounds
-        min_x = max(min_x, 0)
-        min_y = max(min_y, 0)
-        max_x = min(max_x, face_shape[0])
-        max_y = min(max_y, face_shape[1])
+        # Bounds are clamped to the resized crop, not the unscaled face box
+        min_x, min_y, max_x, max_y = mouth_mask_bounds(
+            landmark_array, padding_pixel_mouth, crop_margin, image_size
+        )
 
         mask = np.zeros_like(np.array(img_resized))
         mask[round(min_y):round(max_y), round(min_x):round(max_x)] = 255
         return Image.fromarray(mask)
 
     def __len__(self):
+        if self.deterministic:
+            return len(self.meta_paths)
         return 100000
 
+    def _pick_meta_path(self, idx, attempts):
+        """Pick the clip to read: by index when deterministic, otherwise at random."""
+        if self.deterministic:
+            return self.meta_paths[(int(idx) + attempts) % len(self.meta_paths)]
+        return random.sample(self.meta_paths, k=1)[0]
+
     def __getitem__(self, idx):
+        if not self.deterministic:
+            return self._load_sample(idx)
+        with seeded_random_state(self.seed_base + int(idx)):
+            return self._load_sample(idx)
+
+    def _load_sample(self, idx):
         attempts = 0
         while attempts < self.max_attempts:
             try:
-                meta_path = random.sample(self.meta_paths, k=1)[0]
+                meta_path = self._pick_meta_path(idx, attempts)
                 with open(meta_path, 'r') as f:
                     meta_data = json.load(f)
             except Exception as e:
@@ -456,6 +461,10 @@ class FaceDataset(Dataset):
 
             # Process audio features
             audio_offset = drive_idx_list[0]
+            # get_audio_file may shift audio_offset to index inside a later
+            # 30 s Whisper window; the SyncNet mel is cut from the full track,
+            # so it must use the original frame index.
+            mel_start_frame = drive_idx_list[0]
             audio_step = step
             fps = 25.0 / step
 
@@ -470,7 +479,7 @@ class FaceDataset(Dataset):
                 time.sleep(0.1)
                 continue
             
-            mel = self.crop_audio_window(audio_feature_mel, audio_offset)
+            mel = self.crop_audio_window(audio_feature_mel, mel_start_frame)
             if mel.shape[0] != syncnet_mel_step_size:
                 attempts += 1
                 print(f"video {video_path} has invalid mel spectrogram shape: {mel.shape}, expected: {syncnet_mel_step_size}")
@@ -499,45 +508,52 @@ class FaceDataset(Dataset):
         raise ValueError("Unable to find a valid sample after maximum attempts.")
 
 class HDTFDataset(FaceDataset):
-    """HDTF dataset class"""
-    def __init__(self, cfg):
+    """HDTF-layout dataset reading one explicit clip list."""
+    def __init__(self, cfg, list_path='./dataset/HDTF/train.txt', repeats=10, deterministic=False):
         root_path = './dataset/HDTF/meta'
-        list_paths = [
-            './dataset/HDTF/train.txt',
-        ]
-        
-
-        repeats = [10]
-        super().__init__(cfg, list_paths, root_path, repeats)
+        list_paths = [list_path]
+        super().__init__(cfg, list_paths, root_path, [repeats], deterministic=deterministic)
         print('HDTFDataset: ', len(self))
 
 class VFHQDataset(FaceDataset):
-    """VFHQ dataset class"""
-    def __init__(self, cfg):
+    """VFHQ-layout dataset reading one explicit clip list."""
+    def __init__(self, cfg, list_path='./dataset/VFHQ/train.txt', repeats=1, deterministic=False):
         root_path = './dataset/VFHQ/meta'
-        list_paths = [
-            './dataset/VFHQ/train.txt',
-        ]
-        repeats = [1]
-        super().__init__(cfg, list_paths, root_path, repeats)
+        list_paths = [list_path]
+        super().__init__(cfg, list_paths, root_path, [repeats], deterministic=deterministic)
         print('VFHQDataset: ', len(self))
         
-def PortraitDataset(cfg=None):
+def PortraitDataset(cfg=None, split="train"):
     """Return dataset based on configuration
     
     Args:
-        cfg: Configuration dictionary
+        cfg: Configuration dictionary. Optional keys ``train_list`` and
+            ``val_list`` override the list paths of the selected dataset.
+        split (str): ``"train"`` samples randomly; ``"val"`` reads ``val_list``
+            deterministically so every validation pass sees the same clips.
+            VFHQ validates on ``./dataset/VFHQ/val.txt`` by default; HDTF and
+            the mixed configuration validate on the HDTF list.
         
     Returns:
         Dataset: Combined dataset
     """
+    if split not in ("train", "val"):
+        raise ValueError(f"Unknown dataset split: {split}")
+    if split == "val":
+        if cfg["dataset_key"] == "VFHQ":
+            val_list = cfg.get("val_list") or './dataset/VFHQ/val.txt'
+            return ConcatDataset([VFHQDataset(cfg, val_list, repeats=1, deterministic=True)])
+        val_list = cfg.get("val_list") or './dataset/HDTF/val.txt'
+        return ConcatDataset([HDTFDataset(cfg, val_list, repeats=1, deterministic=True)])
+
+    train_list = cfg.get("train_list")
     if cfg["dataset_key"] == "HDTF":
-        return ConcatDataset([HDTFDataset(cfg)])
+        return ConcatDataset([HDTFDataset(cfg, train_list or './dataset/HDTF/train.txt')])
     elif cfg["dataset_key"] == "VFHQ":
-        return ConcatDataset([VFHQDataset(cfg)])
+        return ConcatDataset([VFHQDataset(cfg, train_list or './dataset/VFHQ/train.txt')])
     else:  
         print("############ use all dataset ############ ")
-        return ConcatDataset([HDTFDataset(cfg), VFHQDataset(cfg)])
+        return ConcatDataset([HDTFDataset(cfg, train_list or './dataset/HDTF/train.txt'), VFHQDataset(cfg)])
 
 
 if __name__ == '__main__':

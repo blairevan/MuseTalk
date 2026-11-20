@@ -26,7 +26,7 @@ if not fast_check_ffmpeg():
     print("Adding ffmpeg to PATH")
     # Choose path separator based on operating system
     path_separator = ';' if sys.platform == 'win32' else ':'
-    os.environ["PATH"] = f"{args.ffmpeg_path}{path_separator}{os.environ['PATH']}"
+    os.environ["PATH"] = f"{ffmpeg_path}{path_separator}{os.environ['PATH']}"
     if not fast_check_ffmpeg():
         print("Warning: Unable to find ffmpeg, please ensure ffmpeg is properly installed")
 
@@ -221,6 +221,7 @@ def analyze_video(org_path: str, dst_path: str, vid_list: List[str]) -> None:
     checkpoint_file = './models/dwpose/dw-ll_ucoco_384.pth'
 
     analyze_face = AnalyzeFace(device, config_file, checkpoint_file)
+    invalid_count = 0
     
     for vid in tqdm(vid_list, desc="Processing videos"):
         #vid = "clip005_WDA_BernieSanders_000.mp4"
@@ -236,6 +237,9 @@ def analyze_video(org_path: str, dst_path: str, vid_list: List[str]) -> None:
             total_bbox_list = []
             total_pts_list = []
             isvalid = True
+            # Stay defined even when the first frame has no detectable face
+            video_height = video_width = None
+            face_height = face_width = None
 
             # process
             try:
@@ -275,11 +279,13 @@ def analyze_video(org_path: str, dst_path: str, vid_list: List[str]) -> None:
                 total_pts_list.append(pts)
                 total_bbox_list.append(bbox)
 
+            if not isvalid:
+                invalid_count += 1
             meta_data = {
                     "mp4_path": vid_path,
                      "wav_path": wav_path,
                      "video_size": [video_height, video_width],
-                     "face_size": [face_height, face_width],
+                     "face_size": [face_height, face_width] if face_height is not None else None,
                      "frames": total_frames,
                      "face_list": total_bbox_list,
                      "landmark_list": total_pts_list,
@@ -287,6 +293,8 @@ def analyze_video(org_path: str, dst_path: str, vid_list: List[str]) -> None:
             }        
             with open(vid_meta, 'w') as f:
                 json.dump(meta_data, f, indent=4)
+
+    print(f"### {invalid_count} clips marked invalid (missing face or landmarks) ###")
             
 
 

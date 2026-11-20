@@ -1,0 +1,18 @@
+# Single-process, single-GPU Accelerate launch config (no DeepSpeed).
+# Usage: accelerate launch --config_file ./configs/training/gpu_single.yaml train.py --config <stage yaml>
+compute_environment: LOCAL_MACHINE
+debug: false
+distributed_type: 'NO'
+downcast_bf16: 'no'
+gpu_ids: '0'
+machine_rank: 0
+main_training_function: main
+mixed_precision: 'no'  # train.py runs in FP32; record the dtype actually used
+num_machines: 1
+num_processes: 1
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
