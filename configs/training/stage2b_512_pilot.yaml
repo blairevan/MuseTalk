@@ -74,6 +74,7 @@ solver:
   mixed_precision: 'fp32'
   enable_xformers_memory_efficient_attention: True
   gradient_checkpointing: True
+  vae_decode_chunk_size: 2  # checkpointed per-chunk VAE decode to cap 16-frame 512 VRAM
   max_train_steps: 25000  # candidate upper bound, not a target
   max_grad_norm: 1.0
   learning_rate: 3.0e-6  # trial value

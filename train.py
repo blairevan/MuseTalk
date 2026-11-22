@@ -47,6 +47,10 @@ from musetalk.utils.checkpoint_utils import (
     validate_resume_step,
 )
 from musetalk.utils.train_schedule import validate_deepspeed_gan_config
+from musetalk.utils.vae_decode import (
+    decode_latents_for_training,
+    resolve_vae_decode_chunk_size,
+)
 from musetalk.utils.training_utils import (
     apply_audio_pe,
     initialize_models_and_optimizers,
@@ -171,6 +175,9 @@ def main(cfg):
         cfg.loss_params.gan_loss,
         cfg.loss_params.mouth_gan_loss,
     )
+    vae_decode_chunk_size = resolve_vae_decode_chunk_size(
+        cfg.solver.get("vae_decode_chunk_size", None)
+    )
 
     # One training job per experiment directory: a second job would delete this
     # job's staging checkpoints and overwrite its weights. The main process holds
@@ -267,6 +274,11 @@ def main(cfg):
     logger.info(
         f"Gradient Accumulation steps = {cfg.solver.gradient_accumulation_steps}")
     logger.info(f"Total optimization steps = {cfg.solver.max_train_steps}")
+    if vae_decode_chunk_size is not None:
+        logger.info(
+            f"VAE decode chunk size = {vae_decode_chunk_size} "
+            f"(checkpoint={bool(cfg.solver.gradient_checkpointing)})"
+        )
 
     global_step = 0
     first_epoch = 0
@@ -483,7 +495,12 @@ def main(cfg):
                 audio_prompts_backward,
             )
             latents_pred = (1 / model_dict['vae'].config.scaling_factor) * latents_pred
-            image_pred = model_dict['vae'].decode(latents_pred).sample
+            image_pred = decode_latents_for_training(
+                model_dict['vae'],
+                latents_pred,
+                chunk_size=vae_decode_chunk_size,
+                use_checkpoint=bool(cfg.solver.gradient_checkpointing),
+            )
             
             # Convert to float
             image_pred = image_pred.float()

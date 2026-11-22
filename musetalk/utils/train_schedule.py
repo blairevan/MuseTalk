@@ -78,3 +78,27 @@ def validate_deepspeed_gan_config(is_deepspeed, gan_loss, mouth_gan_loss):
             "each discriminator backward() advances the DeepSpeed engine step; launch with "
             "--config_file ./configs/training/gpu_single.yaml instead."
         )
+
+
+def normalize_adam_betas(betas):
+    """Convert configured Adam betas to a plain Python ``(beta1, beta2)`` tuple.
+
+    OmegaConf parses YAML lists as ``ListConfig``. Passing a ``ListConfig`` into
+    ``torch.optim.AdamW`` embeds it in the saved optimizer state dict, which
+    fails to load under PyTorch 2.6+ ``torch.load(..., weights_only=True)``.
+
+    Args:
+        betas (Iterable[float]): Two-element sequence ``(beta1, beta2)``.
+
+    Returns:
+        tuple[float, float]: Plain Python float 2-tuple.
+
+    Raises:
+        ValueError: If ``betas`` does not contain exactly two numeric values.
+    """
+    if isinstance(betas, (str, bytes)):
+        raise ValueError(f"Adam betas must be a 2-element sequence, got {betas!r}")
+    values = tuple(float(beta) for beta in betas)
+    if len(values) != 2:
+        raise ValueError(f"Adam betas must have length 2, got {len(values)}")
+    return values

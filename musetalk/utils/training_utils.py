@@ -17,7 +17,7 @@ from musetalk.loss.discriminator import MultiScaleDiscriminator, DiscriminatorFu
 from musetalk.loss.basic_loss import Interpolate
 import musetalk.loss.vgg_face as vgg_face
 from musetalk.data.dataset import PortraitDataset
-from musetalk.utils.train_schedule import compute_schedule_steps
+from musetalk.utils.train_schedule import compute_schedule_steps, normalize_adam_betas
 from musetalk.utils.utils import (
     get_image_pred,
     process_audio_features,
@@ -253,10 +253,10 @@ def initialize_loss_functions(cfg, accelerator, scheduler_max_steps):
         loss_dict['disc_scales'] = cfg.model_params.discriminator_params.scales
         loss_dict['optimizer_D'] = optim.AdamW(
             loss_dict['discriminator'].parameters(),
-            lr=cfg.discriminator_train_params.lr,
-            weight_decay=cfg.discriminator_train_params.weight_decay,
-            betas=cfg.discriminator_train_params.betas,
-            eps=cfg.discriminator_train_params.eps)
+            lr=float(cfg.discriminator_train_params.lr),
+            weight_decay=float(cfg.discriminator_train_params.weight_decay),
+            betas=normalize_adam_betas(cfg.discriminator_train_params.betas),
+            eps=float(cfg.discriminator_train_params.eps))
         loss_dict['scheduler_D'] = CosineAnnealingLR(
             loss_dict['optimizer_D'],
             T_max=scheduler_max_steps,
@@ -269,10 +269,10 @@ def initialize_loss_functions(cfg, accelerator, scheduler_max_steps):
         loss_dict['mouth_discriminator_full'] = DiscriminatorFullModel(loss_dict['mouth_discriminator'])
         loss_dict['mouth_optimizer_D'] = optim.AdamW(
             loss_dict['mouth_discriminator'].parameters(),
-            lr=cfg.discriminator_train_params.lr,
-            weight_decay=cfg.discriminator_train_params.weight_decay,
-            betas=cfg.discriminator_train_params.betas,
-            eps=cfg.discriminator_train_params.eps)
+            lr=float(cfg.discriminator_train_params.lr),
+            weight_decay=float(cfg.discriminator_train_params.weight_decay),
+            betas=normalize_adam_betas(cfg.discriminator_train_params.betas),
+            eps=float(cfg.discriminator_train_params.eps))
         loss_dict['mouth_scheduler_D'] = CosineAnnealingLR(
             loss_dict['mouth_optimizer_D'],
             T_max=scheduler_max_steps,
