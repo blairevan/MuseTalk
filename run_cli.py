@@ -14,19 +14,32 @@ from musetalk.utils.clarity import (
 )
 
 
+DEFAULT_512_UNET_PATH = "./models/musetalkV15_512/unet.pth"
+DEFAULT_512_CONFIG_PATH = "./models/musetalkV15_512/musetalk.json"
+
+
 def resolve_model_settings(
     model_version,
-    resolution,
+    resolution=None,
     unet_model_path=None,
     unet_config=None,
     use_audio_pe=None,
     ref_frame_mode=None,
+    batch_size=None,
+    use_float16=None,
+    path_exists=None,
 ):
-    """Resolve model checkpoint paths, version flag, audio PE, and ref-frame defaults.
+    """Resolve model checkpoint paths, resolution, precision, and inference defaults.
+
+    When ``resolution`` is ``None`` and ``model_version == "v1.5"`` with no
+    explicit UNet overrides, automatically selects ``512`` if both
+    :data:`DEFAULT_512_UNET_PATH` and :data:`DEFAULT_512_CONFIG_PATH` exist on
+    disk; otherwise falls back cleanly to ``256``.
 
     Args:
         model_version (str): CLI model version (``"v1.0"`` or ``"v1.5"``).
-        resolution (int): Generation resolution in pixels (``256`` or ``512``).
+        resolution (int | None): Explicit generation resolution (``256`` or
+            ``512``), or ``None`` to auto-detect 512 weights.
         unet_model_path (str | None): Explicit UNet weights path override.
         unet_config (str | None): Explicit UNet config JSON path override.
         use_audio_pe (bool | None): Explicit audio PE flag, or ``None`` to pick
@@ -34,17 +47,36 @@ def resolve_model_settings(
         ref_frame_mode (str | None): Explicit UNet reference-frame mode, or
             ``None`` to pick the resolution default (``"self"`` for 256,
             ``"auto"`` for 512).
+        batch_size (int | None): Explicit batch size, or ``None`` to pick the
+            resolution default (``8`` for 256, ``2`` for 512).
+        use_float16 (bool | None): Explicit FP16 toggle, or ``None`` to pick
+            the resolution default (``False`` for 256, ``True`` for 512).
+        path_exists (Callable[[str], bool] | None): Optional file existence
+            predicate; defaults to ``os.path.isfile`` at call time.
 
     Returns:
         dict: Mapping with ``unet_model_path``, ``unet_config``, ``version_arg``,
-            ``resolution``, ``use_audio_pe``, and ``ref_frame_mode``.
+            ``resolution``, ``use_audio_pe``, ``ref_frame_mode``, ``batch_size``,
+            and ``use_float16``.
 
     Raises:
-        ValueError: If ``resolution`` or ``ref_frame_mode`` is unsupported, or
-            ``v1.0`` is paired with ``resolution=512`` without explicit UNet
-            path overrides.
+        ValueError: If ``resolution``, ``ref_frame_mode``, or ``batch_size`` is
+            invalid, or ``v1.0`` is paired with ``resolution=512`` without
+            explicit UNet path overrides.
     """
-    resolved_resolution = validate_resolution(resolution)
+    exists_fn = os.path.isfile if path_exists is None else path_exists
+    if resolution is None:
+        has_512_weights = (
+            model_version == "v1.5"
+            and not unet_model_path
+            and not unet_config
+            and bool(exists_fn(DEFAULT_512_UNET_PATH))
+            and bool(exists_fn(DEFAULT_512_CONFIG_PATH))
+        )
+        resolved_resolution = 512 if has_512_weights else 256
+    else:
+        resolved_resolution = validate_resolution(resolution)
+
     if model_version == "v1.0":
         if resolved_resolution != 256 and not (unet_model_path and unet_config):
             raise ValueError(
@@ -55,8 +87,8 @@ def resolve_model_settings(
         default_cfg = "./models/musetalk/musetalk.json"
         version_arg = "v1"
     elif resolved_resolution == 512:
-        default_unet = "./models/musetalkV15_512/unet.pth"
-        default_cfg = "./models/musetalkV15_512/musetalk.json"
+        default_unet = DEFAULT_512_UNET_PATH
+        default_cfg = DEFAULT_512_CONFIG_PATH
         version_arg = "v15"
     else:
         default_unet = "./models/musetalkV15/unet.pth"
@@ -69,6 +101,14 @@ def resolve_model_settings(
         if ref_frame_mode is None
         else validate_ref_frame_mode(ref_frame_mode)
     )
+    if batch_size is None:
+        resolved_batch_size = 2 if resolved_resolution == 512 else 8
+    else:
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError(f"batch_size must be a positive integer, got {batch_size!r}")
+        resolved_batch_size = batch_size
+    resolved_float16 = (resolved_resolution == 512) if use_float16 is None else bool(use_float16)
+
     return {
         "unet_model_path": unet_model_path or default_unet,
         "unet_config": unet_config or default_cfg,
@@ -76,6 +116,8 @@ def resolve_model_settings(
         "resolution": resolved_resolution,
         "use_audio_pe": resolved_audio_pe,
         "ref_frame_mode": resolved_ref_mode,
+        "batch_size": resolved_batch_size,
+        "use_float16": resolved_float16,
     }
 
 def validate_inputs(face_path, audio_path):
@@ -143,8 +185,8 @@ def main():
     parser.add_argument("--audio", type=str, required=True, help="Input audio path")
     parser.add_argument("--outfile", type=str, required=True, help="Output video path (must be a specific .mp4 file)")
     parser.add_argument("--model_version", type=str, default="v1.5", choices=["v1.0", "v1.5"])
-    parser.add_argument("--resolution", type=int, default=256, choices=list(SUPPORTED_RESOLUTIONS),
-                        help="UNet/VAE generation resolution in pixels (256 legacy or 512 high-resolution)")
+    parser.add_argument("--resolution", type=int, default=None, choices=list(SUPPORTED_RESOLUTIONS),
+                        help="UNet/VAE generation resolution in pixels (default: auto 512 when models/musetalkV15_512 exists, else 256)")
     parser.add_argument("--unet_model_path", type=str, default=None,
                         help="Optional override path for UNet weights")
     parser.add_argument("--unet_config", type=str, default=None,
@@ -162,8 +204,13 @@ def main():
     parser.add_argument("--bbox_smooth_window", type=int, default=7, help="Centered moving-average window for bbox smoothing; 1 disables smoothing")
     parser.add_argument("--close_mouth_start", type=parse_bool, default=True, help="Close mouth during leading silence (true/false)")
     parser.add_argument("--close_mouth_end", type=parse_bool, default=False, help="Close mouth during trailing silence (true/false)")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for inference")
-    parser.add_argument("--use_float16", action="store_true", help="Use float16 for lower GPU memory usage")
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="Batch size for inference (default: 8 for 256, 2 for 512)")
+    fp16_group = parser.add_mutually_exclusive_group()
+    fp16_group.add_argument("--use_float16", action="store_true", dest="use_float16", default=None,
+                            help="Use float16 for lower GPU memory usage (default: enabled for 512, disabled for 256)")
+    fp16_group.add_argument("--no_float16", action="store_false", dest="use_float16",
+                            help="Force float32 inference even when resolution is 512")
     # Clarity options. The first four defaults were adopted after 4K A/B runs on
     # an RTX 5070; pass the legacy values to reproduce the previous output.
     parser.add_argument("--vae_latent_mode", type=str, default="mode", choices=["sample", "mode"],
@@ -227,6 +274,8 @@ def main():
             unet_config=args.unet_config,
             use_audio_pe=args.use_audio_pe,
             ref_frame_mode=args.ref_frame_mode,
+            batch_size=args.batch_size,
+            use_float16=args.use_float16,
         )
     except ValueError as err:
         print(f"❌ 错误: {err}")
@@ -255,7 +304,7 @@ def main():
         "--bbox_smooth_window", str(args.bbox_smooth_window),
         "--close_mouth_start", str(args.close_mouth_start).lower(),
         "--close_mouth_end", str(args.close_mouth_end).lower(),
-        "--batch_size", str(args.batch_size),
+        "--batch_size", str(model_settings["batch_size"]),
         "--vae_latent_mode", args.vae_latent_mode,
         "--paste_interpolation", args.paste_interpolation,
         "--enhance_mode", args.enhance_mode,
@@ -269,7 +318,7 @@ def main():
         "--use_audio_pe", str(model_settings["use_audio_pe"]).lower(),
         "--ref_frame_mode", model_settings["ref_frame_mode"],
     ]
-    if args.use_float16:
+    if model_settings["use_float16"]:
         cmd.append("--use_float16")
     
     print(f"🚀 开始执行数字人合成任务...\n底层调用命令: {' '.join(cmd)}\n")

@@ -79,7 +79,7 @@ class LowerFaceAlphaTest(unittest.TestCase):
 class RunCliPassThroughTest(unittest.TestCase):
     """run_cli.py forwards legacy defaults unless options are set."""
 
-    def _run(self, extra_args):
+    def _run(self, extra_args, has_512_weights=False):
         import run_cli
 
         captured = {}
@@ -87,12 +87,22 @@ class RunCliPassThroughTest(unittest.TestCase):
         def fake_run(cmd, check):
             captured["cmd"] = cmd
 
+        real_isfile = os.path.isfile
+        weights_512 = {run_cli.DEFAULT_512_UNET_PATH, run_cli.DEFAULT_512_CONFIG_PATH}
+
+        def fake_isfile(path):
+            if path in weights_512:
+                return has_512_weights
+            return real_isfile(path)
+
         argv = ["run_cli.py", "--face", "f.png", "--audio", "a.wav", "--outfile", "/tmp/o.mp4"] + extra_args
         with mock.patch.object(run_cli, "validate_inputs", return_value=True), \
+                mock.patch.object(run_cli.os.path, "isfile", side_effect=fake_isfile), \
                 mock.patch.object(run_cli.subprocess, "run", side_effect=fake_run), \
                 mock.patch.object(sys, "argv", argv):
             run_cli.main()
         cmd = captured["cmd"]
+        self.last_cmd = cmd
         self.last_config = cmd[cmd.index("--inference_config") + 1]
         return {cmd[i]: cmd[i + 1] for i in range(len(cmd) - 1) if cmd[i].startswith("--")}
 
@@ -107,11 +117,13 @@ class RunCliPassThroughTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.last_config))
 
     def test_defaults_use_adopted_clarity_settings(self):
-        """The four A/B-approved options are on; experimental ones stay off."""
-        opts = self._run([])
+        """Without local 512 weights, legacy 256 defaults and clarity options apply."""
+        opts = self._run([], has_512_weights=False)
         self.assertEqual(opts["--resolution"], "256")
         self.assertEqual(opts["--unet_model_path"], "./models/musetalkV15/unet.pth")
         self.assertEqual(opts["--unet_config"], "./models/musetalkV15/musetalk.json")
+        self.assertEqual(opts["--batch_size"], "8")
+        self.assertNotIn("--use_float16", self.last_cmd)
         self.assertEqual(opts["--vae_latent_mode"], "mode")
         self.assertEqual(opts["--paste_interpolation"], "lanczos")
         self.assertEqual(opts["--enhance_mode"], "usm")
@@ -120,14 +132,46 @@ class RunCliPassThroughTest(unittest.TestCase):
         self.assertEqual(opts["--close_mouth_pauses"], "false")
         self.assertEqual(opts["--pause_top_db"], "38.0")
         self.assertEqual(opts["--use_audio_pe"], "true")
+        self.assertEqual(opts["--ref_frame_mode"], "self")
+
+    def test_auto_selects_512_with_safe_defaults_when_512_weights_exist(self):
+        """Unmodified v1.5 CLI auto-enables 512 with bs=2, fp16, pe=false, ref=auto when 512 weights exist."""
+        opts = self._run([], has_512_weights=True)
+        self.assertEqual(opts["--resolution"], "512")
+        self.assertEqual(opts["--unet_model_path"], "./models/musetalkV15_512/unet.pth")
+        self.assertEqual(opts["--unet_config"], "./models/musetalkV15_512/musetalk.json")
+        self.assertEqual(opts["--batch_size"], "2")
+        self.assertIn("--use_float16", self.last_cmd)
+        self.assertEqual(opts["--use_audio_pe"], "false")
+        self.assertEqual(opts["--ref_frame_mode"], "auto")
+
+    def test_explicit_256_and_512_precision_overrides_work_when_512_weights_exist(self):
+        """Explicit --resolution 256 or --no_float16/--batch_size overrides auto defaults."""
+        forced_256 = self._run(["--resolution", "256"], has_512_weights=True)
+        self.assertEqual(forced_256["--resolution"], "256")
+        self.assertEqual(forced_256["--unet_model_path"], "./models/musetalkV15/unet.pth")
+        self.assertEqual(forced_256["--batch_size"], "8")
+        self.assertNotIn("--use_float16", self.last_cmd)
+        self.assertEqual(forced_256["--use_audio_pe"], "true")
+        self.assertEqual(forced_256["--ref_frame_mode"], "self")
+
+        forced_fp32 = self._run(["--batch_size", "1", "--no_float16"], has_512_weights=True)
+        self.assertEqual(forced_fp32["--resolution"], "512")
+        self.assertEqual(forced_fp32["--batch_size"], "1")
+        self.assertNotIn("--use_float16", self.last_cmd)
+
+        v10_opts = self._run(["--model_version", "v1.0"], has_512_weights=True)
+        self.assertEqual(v10_opts["--resolution"], "256")
 
     def test_resolution_512_selects_512_weights_and_disables_audio_pe_by_default(self):
-        """Passing --resolution 512 routes to musetalkV15_512, use_audio_pe=false, ref_frame_mode=auto."""
+        """Passing --resolution 512 routes to musetalkV15_512, bs=2, fp16, use_audio_pe=false, ref=auto."""
         opts = self._run(["--resolution", "512"])
         self.assertEqual(opts["--resolution"], "512")
         self.assertEqual(opts["--version"], "v15")
         self.assertEqual(opts["--unet_model_path"], "./models/musetalkV15_512/unet.pth")
         self.assertEqual(opts["--unet_config"], "./models/musetalkV15_512/musetalk.json")
+        self.assertEqual(opts["--batch_size"], "2")
+        self.assertIn("--use_float16", self.last_cmd)
         self.assertEqual(opts["--use_audio_pe"], "false")
         self.assertEqual(opts["--ref_frame_mode"], "auto")
 

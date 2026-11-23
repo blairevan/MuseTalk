@@ -43,6 +43,11 @@ python run_cli.py \
 | Argument (参数名) | Type (类型) | Default (默认值) | Choices (候选值) | Description (说明) |
 | :--- | :--- | :--- | :--- | :--- |
 | `--model_version` | `str` | `"v1.5"` | `["v1.0", "v1.5"]` | Select the MuseTalk model version. (选择 MuseTalk 模型版本) |
+| `--resolution` | `int` | `auto` | `[256, 512]` | Generation resolution. Auto-selects `512` when `v1.5` and `./models/musetalkV15_512/{unet.pth,musetalk.json}` exist; otherwise falls back to `256`. Pass `--resolution 256` to force legacy 256. (生成分辨率；本地存在 512 权重时自动启用 `512`，否则回退 `256`) |
+| `--unet_model_path` | `str` | `auto` | | Optional override for UNet weights path. (可选自定义 UNet 权重路径) |
+| `--unet_config` | `str` | `auto` | | Optional override for UNet config JSON path. (可选自定义 UNet 配置路径) |
+| `--batch_size` | `int` | `auto` | | Inference batch size (`2` for 512, `8` for 256 unless explicitly specified). (推理批大小；512 默认 `2`，256 默认 `8`) |
+| `--use_float16` / `--no_float16` | `flag` | `auto` | | FP16 toggle (`enabled` by default for 512 to stay within 12 GB VRAM; `disabled` by default for 256). Pass `--no_float16` to force FP32 at 512. (FP16 开关；512 默认开启防显存溢出，256 默认关闭) |
 
 ---
 
@@ -91,7 +96,8 @@ The first four options below are **on by default** since 2026-11-20, after 4K A/
 | `--pause_min_frames` | `int` | `8` | Shortest pause, in frames, that closes the mouth. (触发闭嘴的最短停顿帧数) |
 | `--pause_fade_frames` | `int` | `4` | Frames used for each fade in and out. (渐入、渐出各用的帧数) |
 | `--pause_top_db` | `float` | `38.0` | Silence threshold below the audio peak, in dB; raise it for audio with background noise or music. (停顿检测门限，相对峰值的分贝数；有底噪或背景音乐时调大) |
-| `--use_audio_pe` | `bool` | `true` | Add positional encoding to Whisper features (legacy). Use `false` only for the PE A/B. (音频位置编码；仅为 A/B 设 false) |
+| `--use_audio_pe` | `bool` | `auto` | Add positional encoding to Whisper features (`true` for 256, `false` for 512 unless explicitly set). (音频位置编码；256 默认 `true`，512 默认 `false`) |
+| `--ref_frame_mode` | `str` | `auto` | UNet reference latent source: `self`, `first`, `offset`, or `auto` (DWPose 68-pt closed-mouth frontal selection). Defaults to `auto` for 512 and `self` for 256. (参考帧策略；512 默认 `auto` 自动检测正脸闭嘴帧，256 默认 `self`) |
 
 Reproduce the previous (pre-2026-11-20) output (复现旧版输出):
 
@@ -123,3 +129,4 @@ The final audio mux now copies the rendered video stream instead of re-encoding 
 | 2026-11-20 17:20:00 +08:00 | 依据 RTX 5070 两条 4K 底板 A/B 结果，将 `vae_latent_mode`、`paste_interpolation`、`enhance_mode`、`protect_upper_face` 改为默认开启；补充旧版复现命令、`close_mouth_pauses` 已知问题，以及合音轨改为拷贝视频流的说明。 |
 | 2026-11-20 17:33:00 +08:00 | 新增 `--pause_top_db` 参数说明（此前底层脚本支持但包装入口未透传）。实测输出视频码率约由 2.5 Mbps 升至 4.6 Mbps（4K、58 s 样例文件 18.6 MB → 34.4 MB），系去掉二次编码所致。 |
 | 2026-11-20 17:52:00 +08:00 | “内部运行机制”更新：每次运行使用唯一的临时任务文件 `temp_cli_task_*.yaml`；底层推理默认不再在输出目录的上级写人脸坐标文件（仅 `--saved_coord` 时写入）。 |
+| 2026-11-24 00:29:00 +08:00 | 补充 `--resolution`、`--unet_model_path`、`--unet_config`、`--batch_size`、`--use_float16`/`--no_float16` 与 `--ref_frame_mode` 说明：`v1.5` 检测到本地 `./models/musetalkV15_512/{unet.pth,musetalk.json}` 时默认自动启用 `512` 并联动安全默认值（`batch_size=2`、`use_float16=true`、`use_audio_pe=false`、`ref_frame_mode=auto`），无 512 权重或显式 `--resolution 256` 时保持旧版 `256` 行为。 |
