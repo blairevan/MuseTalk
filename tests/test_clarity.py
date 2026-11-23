@@ -142,6 +142,148 @@ class ResolutionValidationTest(unittest.TestCase):
             clarity.validate_cached_avatar_resolution("av1", {"resolution": 512}, 256)
 
 
+class RefFrameModeTest(unittest.TestCase):
+    """Reference-frame latent pairing for cross-driven inference."""
+
+    def test_resolve_ref_frame_index_modes(self):
+        """self keeps index, first pins 0, offset picks half-cycle frame."""
+        self.assertEqual(clarity.resolve_ref_frame_index(3, 10, "self"), 3)
+        self.assertEqual(clarity.resolve_ref_frame_index(3, 10, "first"), 0)
+        self.assertEqual(clarity.resolve_ref_frame_index(0, 10, "offset"), 5)
+        self.assertEqual(clarity.resolve_ref_frame_index(7, 10, "offset"), 2)
+        self.assertEqual(clarity.resolve_ref_frame_index(0, 1, "offset"), 0)
+        self.assertEqual(clarity.resolve_ref_frame_index(3, 10, "auto", auto_ref_index=7), 7)
+        with self.assertRaises(ValueError):
+            clarity.validate_ref_frame_mode("random")
+        with self.assertRaises(ValueError):
+            clarity.resolve_ref_frame_index(0, 0, "first")
+        with self.assertRaises(ValueError):
+            clarity.resolve_ref_frame_index(4, 4, "self")
+        with self.assertRaises(ValueError):
+            clarity.resolve_ref_frame_index(0, 4, "auto", auto_ref_index=4)
+
+    def _make_landmarks(self, mouth_gap=0.0, yaw_shift=0.0):
+        """Build synthetic 68-point facial landmarks with tunable mouth gap and yaw."""
+        pts = np.zeros((68, 2), dtype=np.float32)
+        pts[0] = [100.0, 200.0]   # left jaw
+        pts[16] = [300.0, 200.0]  # right jaw
+        pts[30] = [200.0 + yaw_shift, 200.0]  # nose tip
+        pts[48] = [160.0, 260.0]  # left mouth corner
+        pts[54] = [240.0, 260.0]  # right mouth corner
+        for top_i, bot_i, x in ((61, 67, 185.0), (62, 66, 200.0), (63, 65, 215.0)):
+            pts[top_i] = [x, 260.0 - mouth_gap * 0.5]
+            pts[bot_i] = [x, 260.0 + mouth_gap * 0.5]
+        return pts
+
+    def test_score_landmark_neutral_ref_prefers_closed_frontal(self):
+        """Closed frontal landmarks yield lower MAR and yaw asymmetry than open/turned."""
+        closed_front = clarity.score_landmark_neutral_ref(self._make_landmarks(mouth_gap=1.0, yaw_shift=0.0))
+        open_front = clarity.score_landmark_neutral_ref(self._make_landmarks(mouth_gap=20.0, yaw_shift=0.0))
+        closed_turned = clarity.score_landmark_neutral_ref(self._make_landmarks(mouth_gap=1.0, yaw_shift=40.0))
+        self.assertLess(closed_front[0], open_front[0])
+        self.assertAlmostEqual(closed_front[1], 0.0, places=5)
+        self.assertGreater(closed_turned[1], 0.35)
+        self.assertIsNone(clarity.score_landmark_neutral_ref(None))
+        self.assertIsNone(clarity.score_landmark_neutral_ref(np.zeros((10, 2))))
+        nan_pts = self._make_landmarks()
+        nan_pts[30, 0] = np.nan
+        self.assertIsNone(clarity.score_landmark_neutral_ref(nan_pts))
+
+    def test_select_auto_ref_frame_index_landmarks_and_fallback(self):
+        """Auto selector picks closed frontal frame via landmarks, or darkest-free mouth on fallback."""
+        coords = [
+            [100, 100, 300, 340],  # 0: wide open mouth
+            [100, 100, 300, 340],  # 1: closed but turned head
+            [100, 100, 300, 340],  # 2: closed + frontal + median box -> winner!
+            (0.0, 0.0, 0.0, 0.0),  # 3: missing detection placeholder
+            [220, 100, 420, 340],  # 4: closed + frontal but far outlier box
+        ]
+        landmarks = [
+            self._make_landmarks(mouth_gap=24.0, yaw_shift=0.0),
+            self._make_landmarks(mouth_gap=1.0, yaw_shift=50.0),
+            self._make_landmarks(mouth_gap=1.5, yaw_shift=2.0),
+            None,
+            self._make_landmarks(mouth_gap=1.5, yaw_shift=2.0),
+        ]
+        self.assertEqual(clarity.select_auto_ref_frame_index(coords, landmarks_list=landmarks), 2)
+
+        # Fallback without landmarks: uses mouth darkness scores
+        closed_img = np.full((100, 100, 3), 180, dtype=np.uint8)
+        open_img = closed_img.copy()
+        open_img[65:78, 35:65] = 20  # dark open mouth cavity
+        self.assertLess(
+            clarity.estimate_mouth_cavity_darkness(closed_img),
+            clarity.estimate_mouth_cavity_darkness(open_img),
+        )
+        dark_scores = [0.22, 0.18, 0.01, None, 0.01]
+        self.assertEqual(
+            clarity.select_auto_ref_frame_index(coords, mouth_darkness_scores=dark_scores),
+            2,
+        )
+        # Empty/missing coords returns 0 safely
+        self.assertEqual(clarity.select_auto_ref_frame_index([(0.0, 0.0, 0.0, 0.0)]), 0)
+
+    def test_rebind_ref_latents_auto_mode(self):
+        """auto mode binds every frame's ref channels to the chosen ref_frame_index."""
+        latents = [
+            np.concatenate(
+                [
+                    np.full((1, 4, 2, 2), float(i), dtype=np.float32),
+                    np.full((1, 4, 2, 2), float(200 + i), dtype=np.float32),
+                ],
+                axis=1,
+            )
+            for i in range(4)
+        ]
+        rebound = clarity.rebind_ref_latents(latents, ref_frame_mode="auto", ref_frame_index=2)
+        for i, lat in enumerate(rebound):
+            self.assertEqual(float(lat[0, 0, 0, 0]), float(i))
+            self.assertEqual(float(lat[0, 4, 0, 0]), 202.0)
+
+    def test_rebind_ref_latents_numpy(self):
+        """self returns original list; first/offset swap only channels [4:8]."""
+        latents = [
+            np.concatenate(
+                [
+                    np.full((1, 4, 2, 2), float(i), dtype=np.float32),
+                    np.full((1, 4, 2, 2), float(100 + i), dtype=np.float32),
+                ],
+                axis=1,
+            )
+            for i in range(4)
+        ]
+        self.assertIs(clarity.rebind_ref_latents(latents, "self"), latents)
+
+        rebound_first = clarity.rebind_ref_latents(latents, "first")
+        for i, lat in enumerate(rebound_first):
+            self.assertEqual(float(lat[0, 0, 0, 0]), float(i))
+            self.assertEqual(float(lat[0, 4, 0, 0]), 100.0)
+
+        rebound_offset = clarity.rebind_ref_latents(latents, "offset")
+        expected_refs = [102.0, 103.0, 100.0, 101.0]
+        for i, (lat, ref_v) in enumerate(zip(rebound_offset, expected_refs)):
+            self.assertEqual(float(lat[0, 0, 0, 0]), float(i))
+            self.assertEqual(float(lat[0, 4, 0, 0]), ref_v)
+
+        with self.assertRaises(ValueError):
+            clarity.rebind_ref_latents([np.zeros((1, 3, 2, 2)), np.zeros((1, 3, 2, 2))], "first")
+
+    def test_rebind_ref_latents_torch(self):
+        """rebind_ref_latents works on PyTorch tensors without copying on self."""
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch is not installed")
+        latents = [
+            torch.cat([torch.full((1, 4, 2, 2), float(i)), torch.full((1, 4, 2, 2), float(10 + i))], dim=1)
+            for i in range(4)
+        ]
+        self.assertIs(clarity.rebind_ref_latents(latents, "self"), latents)
+        rebound = clarity.rebind_ref_latents(latents, "offset")
+        self.assertEqual(float(rebound[1][0, 0, 0, 0]), 1.0)
+        self.assertEqual(float(rebound[1][0, 4, 0, 0]), 13.0)
+
+
 class TeethCorrectionTest(unittest.TestCase):
     """Mouth-interior brightness correction."""
 

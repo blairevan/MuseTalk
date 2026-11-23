@@ -37,11 +37,16 @@ from musetalk.utils.audio_utils import (
 from musetalk.utils.clarity import (
     ENHANCE_MODES,
     PASTE_INTERPOLATION_MODES,
+    REF_FRAME_MODES,
     SUPPORTED_RESOLUTIONS,
     blend_faces,
     correct_teeth_whiteness,
+    estimate_mouth_cavity_darkness,
+    rebind_ref_latents,
     resize_generated_face,
+    select_auto_ref_frame_index,
     sharpen_lip_region,
+    validate_ref_frame_mode,
     validate_resolution,
 )
 from musetalk.utils.frame_io import FrameSequence
@@ -141,8 +146,9 @@ def main(args):
         if not fast_check_ffmpeg():
             print("Warning: Unable to find ffmpeg, please ensure ffmpeg is properly installed")
     
-    # Validate generation resolution before loading any models
+    # Validate generation resolution and reference-frame mode before loading any models
     resolution = validate_resolution(getattr(args, "resolution", 256))
+    ref_frame_mode = validate_ref_frame_mode(getattr(args, "ref_frame_mode", "self"))
 
     # Set computing device
     device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
@@ -243,6 +249,7 @@ def main(args):
 
             # Preprocess input images
             frames = FrameSequence(input_img_list)
+            landmarks_list = None
             try:
                 coord_list = None
                 if os.path.exists(crop_coord_save_path) and args.use_saved_coord:
@@ -255,7 +262,14 @@ def main(args):
                         print("Ignoring saved coordinates with a different frame count")
                 if coord_list is None:
                     print("Extracting landmarks... time-consuming operation")
-                    coord_list = get_frame_bboxes(frames, bbox_shift)
+                    if ref_frame_mode == "auto":
+                        coord_list, landmarks_list = get_frame_bboxes(
+                            frames,
+                            bbox_shift,
+                            return_landmarks=True,
+                        )
+                    else:
+                        coord_list = get_frame_bboxes(frames, bbox_shift)
                     if len(coord_list) != len(frames):
                         raise ValueError("Expected one face box per source frame")
                     # Only persist coordinates on request: the file is keyed by the face
@@ -389,11 +403,15 @@ def main(args):
             last_valid_bbox = first_valid_bbox
             last_valid_latents = first_valid_latents
 
+            need_darkness_fallback = (ref_frame_mode == "auto" and landmarks_list is None)
+            mouth_darkness_scores = [] if need_darkness_fallback else None
             for idx, bbox in enumerate(coord_list):
                 if bbox == coord_placeholder or (bbox[2]-bbox[0]) <= 0 or (bbox[3]-bbox[1]) <= 0:
                     # Face detection failed, fallback to previous valid frame data without skipping
                     coord_list[idx] = last_valid_bbox
                     input_latent_list.append(last_valid_latents)
+                    if need_darkness_fallback:
+                        mouth_darkness_scores.append(None)
                     continue
                 
                 frame = frames[idx]
@@ -421,11 +439,35 @@ def main(args):
                     last_valid_bbox = bbox
                     last_valid_latents = latents
                     input_latent_list.append(latents)
+                    if need_darkness_fallback:
+                        mouth_darkness_scores.append(estimate_mouth_cavity_darkness(crop_frame))
                 except Exception as e:
                     # Fallback on resize/extraction failures
                     coord_list[idx] = last_valid_bbox
                     input_latent_list.append(last_valid_latents)
+                    if need_darkness_fallback:
+                        mouth_darkness_scores.append(None)
         
+            # Optionally pair each frame's masked latent with a non-self reference frame
+            auto_ref_idx = None
+            if ref_frame_mode == "auto":
+                auto_ref_idx = select_auto_ref_frame_index(
+                    coord_list,
+                    landmarks_list=landmarks_list,
+                    mouth_darkness_scores=mouth_darkness_scores,
+                    placeholder=coord_placeholder,
+                )
+                ref_source = "dwpose-68pt" if landmarks_list is not None else "mouth-roi-fallback"
+                print(
+                    f"Auto-selected neutral reference frame: {auto_ref_idx}/{len(frames)} "
+                    f"(source={ref_source})"
+                )
+            input_latent_list = rebind_ref_latents(
+                input_latent_list,
+                ref_frame_mode=ref_frame_mode,
+                ref_frame_index=auto_ref_idx,
+            )
+
             # Ping-Pong mirror cycle to eliminate seam at loop boundary
             # Original: [0, 1, ..., N-1] → Extended: [0, 1, ..., N-1, N-2, ..., 1]
             frame_index_cycle = build_ping_pong_cycle(list(range(len(frames))))
@@ -708,5 +750,7 @@ if __name__ == "__main__":
     parser.add_argument("--pause_top_db", type=float, default=38.0, help="Silence threshold below the audio peak, in dB")
     parser.add_argument("--use_audio_pe", type=parse_bool, default=True,
                         help="Add positional encoding to Whisper features (legacy true; for A/B against training)")
+    parser.add_argument("--ref_frame_mode", type=str, default="self", choices=list(REF_FRAME_MODES),
+                        help="UNet reference latent source: 'self' (legacy), 'first' (frame 0), 'offset' (half-cycle), or 'auto' (best closed-mouth frontal frame)")
     args = parser.parse_args()
     main(args)

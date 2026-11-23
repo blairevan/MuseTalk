@@ -103,16 +103,45 @@ def get_bbox_range(img_list,upperbondrange =0):
     return text_range
     
 
-def get_landmark_and_bbox(img_list, upperbondrange=0):
-    """Return face boxes and decoded frames for callers that retain both."""
+def get_landmark_and_bbox(img_list, upperbondrange=0, return_landmarks=False):
+    """Return face boxes and decoded frames for callers that retain both.
+
+    Args:
+        img_list (list[str]): Ordered image paths.
+        upperbondrange (int): Vertical bbox shift adjustment.
+        return_landmarks (bool): When ``True``, also return per-frame 68-point
+            DWPose face landmarks (or ``None`` when detection failed).
+
+    Returns:
+        tuple: ``(coords_list, frames)`` when ``return_landmarks=False``, or
+            ``(coords_list, frames, landmarks_list)`` when ``True``.
+    """
     frames = read_imgs(img_list)
+    if return_landmarks:
+        coords_list, landmarks_list = get_frame_bboxes(
+            frames,
+            upperbondrange,
+            return_landmarks=True,
+        )
+        return coords_list, frames, landmarks_list
     return get_frame_bboxes(frames, upperbondrange), frames
 
 
-def get_frame_bboxes(frames, upperbondrange=0):
-    """Detect one face box per source frame while iterating over the frames."""
+def get_frame_bboxes(frames, upperbondrange=0, return_landmarks=False):
+    """Detect one face box per source frame while iterating over the frames.
+
+    Args:
+        frames: Iterable of BGR frames.
+        upperbondrange (int): Vertical bbox shift adjustment.
+        return_landmarks (bool): When ``True``, return ``(coords_list, landmarks_list)``
+            where each landmark entry is a ``(68, 2)`` array or ``None``.
+
+    Returns:
+        list | tuple[list, list]: Bounding box list, or ``(coords_list, landmarks_list)``.
+    """
     pose_model, face_alignment = get_landmark_models()
     coords_list = []
+    landmarks_list = []
     if upperbondrange != 0:
         print('get key_landmark and face bounding boxes with the bbox_shift:',upperbondrange)
     else:
@@ -134,9 +163,11 @@ def get_frame_bboxes(frames, upperbondrange=0):
         for j, f in enumerate(bbox):
             if f is None: # no face in the image
                 coords_list += [coord_placeholder]
+                if return_landmarks:
+                    landmarks_list.append(None)
                 continue
             
-            half_face_coord =  face_land_mark[29]#np.mean([face_land_mark[28], face_land_mark[29]], axis=0)
+            half_face_coord =  face_land_mark[29].copy()#np.mean([face_land_mark[28], face_land_mark[29]], axis=0)
             range_minus = (face_land_mark[30]- face_land_mark[29])[1]
             range_plus = (face_land_mark[29]- face_land_mark[28])[1]
             average_range_minus.append(range_minus)
@@ -154,8 +185,12 @@ def get_frame_bboxes(frames, upperbondrange=0):
                 coords_list += [f]
                 w,h = f[2]-f[0], f[3]-f[1]
                 print("error bbox:",f)
+                if return_landmarks:
+                    landmarks_list.append(None)
             else:
                 coords_list += [f_landmark]
+                if return_landmarks:
+                    landmarks_list.append(face_land_mark.copy())
         clear_cuda_cache_periodically(frame_number)
     
     print("********************************************bbox_shift parameter adjustment**********************************************************")
@@ -164,6 +199,8 @@ def get_frame_bboxes(frames, upperbondrange=0):
     else:
         print(f"No face detected in {len(frames)} source frames.")
     print("*************************************************************************************************************************************")
+    if return_landmarks:
+        return coords_list, landmarks_list
     return coords_list
     
 

@@ -6,7 +6,12 @@ import yaml
 import subprocess
 
 from musetalk.utils.audio_utils import parse_bool
-from musetalk.utils.clarity import SUPPORTED_RESOLUTIONS, validate_resolution
+from musetalk.utils.clarity import (
+    REF_FRAME_MODES,
+    SUPPORTED_RESOLUTIONS,
+    validate_ref_frame_mode,
+    validate_resolution,
+)
 
 
 def resolve_model_settings(
@@ -15,8 +20,9 @@ def resolve_model_settings(
     unet_model_path=None,
     unet_config=None,
     use_audio_pe=None,
+    ref_frame_mode=None,
 ):
-    """Resolve model checkpoint paths, version flag, and audio PE default.
+    """Resolve model checkpoint paths, version flag, audio PE, and ref-frame defaults.
 
     Args:
         model_version (str): CLI model version (``"v1.0"`` or ``"v1.5"``).
@@ -25,14 +31,18 @@ def resolve_model_settings(
         unet_config (str | None): Explicit UNet config JSON path override.
         use_audio_pe (bool | None): Explicit audio PE flag, or ``None`` to pick
             the resolution default (``True`` for 256, ``False`` for 512).
+        ref_frame_mode (str | None): Explicit UNet reference-frame mode, or
+            ``None`` to pick the resolution default (``"self"`` for 256,
+            ``"auto"`` for 512).
 
     Returns:
         dict: Mapping with ``unet_model_path``, ``unet_config``, ``version_arg``,
-            ``resolution``, and ``use_audio_pe``.
+            ``resolution``, ``use_audio_pe``, and ``ref_frame_mode``.
 
     Raises:
-        ValueError: If ``resolution`` is unsupported or ``v1.0`` is paired with
-            ``resolution=512`` without explicit UNet path overrides.
+        ValueError: If ``resolution`` or ``ref_frame_mode`` is unsupported, or
+            ``v1.0`` is paired with ``resolution=512`` without explicit UNet
+            path overrides.
     """
     resolved_resolution = validate_resolution(resolution)
     if model_version == "v1.0":
@@ -54,12 +64,18 @@ def resolve_model_settings(
         version_arg = "v15"
 
     resolved_audio_pe = (resolved_resolution == 256) if use_audio_pe is None else bool(use_audio_pe)
+    resolved_ref_mode = (
+        ("auto" if resolved_resolution == 512 else "self")
+        if ref_frame_mode is None
+        else validate_ref_frame_mode(ref_frame_mode)
+    )
     return {
         "unet_model_path": unet_model_path or default_unet,
         "unet_config": unet_config or default_cfg,
         "version_arg": version_arg,
         "resolution": resolved_resolution,
         "use_audio_pe": resolved_audio_pe,
+        "ref_frame_mode": resolved_ref_mode,
     }
 
 def validate_inputs(face_path, audio_path):
@@ -169,6 +185,8 @@ def main():
     parser.add_argument("--pause_top_db", type=float, default=38.0, help="Silence threshold below the audio peak, in dB")
     parser.add_argument("--use_audio_pe", type=parse_bool, default=None,
                         help="Add positional encoding to Whisper features (default: true for 256, false for 512)")
+    parser.add_argument("--ref_frame_mode", type=str, default=None, choices=list(REF_FRAME_MODES),
+                        help="UNet reference latent source: 'self', 'first', 'offset', or 'auto' (default: self for 256, auto for 512)")
     
     args = parser.parse_args()
 
@@ -208,6 +226,7 @@ def main():
             unet_model_path=args.unet_model_path,
             unet_config=args.unet_config,
             use_audio_pe=args.use_audio_pe,
+            ref_frame_mode=args.ref_frame_mode,
         )
     except ValueError as err:
         print(f"❌ 错误: {err}")
@@ -248,6 +267,7 @@ def main():
         "--pause_fade_frames", str(args.pause_fade_frames),
         "--pause_top_db", str(args.pause_top_db),
         "--use_audio_pe", str(model_settings["use_audio_pe"]).lower(),
+        "--ref_frame_mode", model_settings["ref_frame_mode"],
     ]
     if args.use_float16:
         cmd.append("--use_float16")

@@ -32,9 +32,13 @@ from musetalk.utils.audio_processor import AudioProcessor
 from musetalk.utils.audio_utils import build_audio_mux_command, parse_bool
 from musetalk.utils.clarity import (
     PASTE_INTERPOLATION_MODES,
+    REF_FRAME_MODES,
     SUPPORTED_RESOLUTIONS,
+    rebind_ref_latents,
     resize_generated_face,
+    select_auto_ref_frame_index,
     validate_cached_avatar_resolution,
+    validate_ref_frame_mode,
     validate_resolution,
 )
 from musetalk.utils.sequence_utils import build_ping_pong_cycle
@@ -103,6 +107,7 @@ class Avatar:
             "mask_blur_ratio": args.mask_blur_ratio,
             "protect_upper_face": args.protect_upper_face,
             "vae_latent_mode": args.vae_latent_mode,
+            "ref_frame_mode": args.ref_frame_mode,
         }
         self.preparation = preparation
         self.batch_size = batch_size
@@ -128,6 +133,7 @@ class Avatar:
             ("mask_blur_ratio", 0.1),
             ("protect_upper_face", False),
             ("vae_latent_mode", "sample"),
+            ("ref_frame_mode", "self"),
         ):
             if cached_info.get(cache_key, legacy_value) != self.avatar_info[cache_key]:
                 print(
@@ -222,7 +228,15 @@ class Avatar:
         input_img_list = sorted(glob.glob(os.path.join(self.full_imgs_path, '*.[jpJP][pnPN]*[gG]')))
 
         print("extracting landmarks...")
-        coord_list, frame_list = get_landmark_and_bbox(input_img_list, self.bbox_shift)
+        landmarks_list = None
+        if args.ref_frame_mode == "auto":
+            coord_list, frame_list, landmarks_list = get_landmark_and_bbox(
+                input_img_list,
+                self.bbox_shift,
+                return_landmarks=True,
+            )
+        else:
+            coord_list, frame_list = get_landmark_and_bbox(input_img_list, self.bbox_shift)
         input_latent_list = []
         coord_placeholder = (0.0, 0.0, 0.0, 0.0)
         
@@ -298,6 +312,20 @@ class Avatar:
             except Exception as e:
                 coord_list[idx] = last_valid_bbox
                 input_latent_list.append(last_valid_latents)
+
+        auto_ref_idx = None
+        if args.ref_frame_mode == "auto":
+            auto_ref_idx = select_auto_ref_frame_index(
+                coord_list,
+                landmarks_list=landmarks_list,
+                placeholder=coord_placeholder,
+            )
+            print(f"Auto-selected neutral reference frame: {auto_ref_idx}/{len(frame_list)}")
+        input_latent_list = rebind_ref_latents(
+            input_latent_list,
+            ref_frame_mode=args.ref_frame_mode,
+            ref_frame_index=auto_ref_idx,
+        )
 
         # Ping-Pong mirror cycle to eliminate seam at loop boundary
         # Original: [0, 1, ..., N-1] → Extended: [0, 1, ..., N-1, N-2, ..., 1]
@@ -520,9 +548,12 @@ if __name__ == "__main__":
                         help="Keep exact source pixels above the blend boundary (true/false); needs re-preparation")
     parser.add_argument("--use_audio_pe", type=parse_bool, default=True,
                         help="Add positional encoding to Whisper features (legacy true)")
+    parser.add_argument("--ref_frame_mode", type=str, default="self", choices=list(REF_FRAME_MODES),
+                        help="UNet reference latent source: 'self' (legacy), 'first' (frame 0), 'offset' (half-cycle), or 'auto' (best closed-mouth frontal frame)")
 
     args = parser.parse_args()
     args.resolution = validate_resolution(args.resolution)
+    args.ref_frame_mode = validate_ref_frame_mode(args.ref_frame_mode)
 
     # Configure ffmpeg path
     if not fast_check_ffmpeg():

@@ -13,9 +13,270 @@ import numpy as np
 PASTE_INTERPOLATION_MODES = ("linear", "lanczos")
 ENHANCE_MODES = ("none", "usm")
 SUPPORTED_RESOLUTIONS = (256, 512)
+REF_FRAME_MODES = ("self", "first", "offset", "auto")
 
 # Legacy generated face size before pasting back.
 _GENERATED_FACE_SIZE = 256.0
+
+
+def validate_ref_frame_mode(mode):
+    """Validate an inference reference-frame selection mode.
+
+    Args:
+        mode (str): ``"self"`` (legacy: pair each frame with its own full latent),
+            ``"first"`` (use frame 0 as a fixed reference latent for every frame),
+            ``"offset"`` (use the half-cycle offset frame as reference), or
+            ``"auto"`` (automatically pick the best closed-mouth frontal frame).
+
+    Returns:
+        str: Validated mode string.
+
+    Raises:
+        ValueError: If ``mode`` is not in :data:`REF_FRAME_MODES`.
+    """
+    if mode not in REF_FRAME_MODES:
+        raise ValueError(
+            f"Unsupported ref_frame_mode {mode!r}; expected one of {REF_FRAME_MODES}"
+        )
+    return mode
+
+
+def resolve_ref_frame_index(frame_index, num_frames, mode="self", auto_ref_index=0):
+    """Choose the source frame index supplying the UNet reference latent.
+
+    Args:
+        frame_index (int): Index of the target frame being rendered.
+        num_frames (int): Total number of unique source frames before ping-pong cycling.
+        mode (str): One of :data:`REF_FRAME_MODES`.
+        auto_ref_index (int): Pre-selected neutral frame index used when
+            ``mode == "auto"``.
+
+    Returns:
+        int: Reference frame index in ``[0, num_frames)``.
+
+    Raises:
+        ValueError: If ``mode`` is unknown, ``num_frames <= 0``, or an index
+            is out of bounds.
+    """
+    validated_mode = validate_ref_frame_mode(mode)
+    if num_frames <= 0:
+        raise ValueError(f"num_frames must be positive, got {num_frames}")
+    if frame_index < 0 or frame_index >= num_frames:
+        raise ValueError(f"frame_index {frame_index} out of range for num_frames={num_frames}")
+    if validated_mode == "self" or num_frames == 1:
+        return frame_index
+    if validated_mode == "first":
+        return 0
+    if validated_mode == "auto":
+        if auto_ref_index < 0 or auto_ref_index >= num_frames:
+            raise ValueError(
+                f"auto_ref_index {auto_ref_index} out of range for num_frames={num_frames}"
+            )
+        return int(auto_ref_index)
+    return (frame_index + num_frames // 2) % num_frames
+
+
+def score_landmark_neutral_ref(landmarks_68):
+    """Compute mouth-openness ratio and frontal yaw asymmetry from 68 landmarks.
+
+    Expects standard 68-point facial landmarks (DWPose ``keypoints[0][23:91]``):
+    jaw contour ``0..16``, nose tip ``30``, outer mouth corners ``48`` and ``54``,
+    and inner lip pairs ``(61, 67)``, ``(62, 66)``, ``(63, 65)``.
+
+    Args:
+        landmarks_68 (np.ndarray): Array-like of shape ``(68, 2)``.
+
+    Returns:
+        tuple[float, float] | None: ``(mouth_aspect_ratio, yaw_asymmetry)``, or
+            ``None`` if landmarks are malformed, non-finite, or degenerate.
+    """
+    if landmarks_68 is None:
+        return None
+    pts = np.asarray(landmarks_68, dtype=np.float32)
+    if pts.shape != (68, 2) or not np.all(np.isfinite(pts)):
+        return None
+    mouth_w = float(np.linalg.norm(pts[54] - pts[48]))
+    jaw_w = float(np.linalg.norm(pts[16] - pts[0]))
+    if mouth_w < 1e-6 or jaw_w < 1e-6:
+        return None
+    inner_gap = float(
+        np.mean([
+            np.linalg.norm(pts[61] - pts[67]),
+            np.linalg.norm(pts[62] - pts[66]),
+            np.linalg.norm(pts[63] - pts[65]),
+        ])
+    )
+    mar = inner_gap / mouth_w
+    left_dist = float(np.linalg.norm(pts[30] - pts[0]))
+    right_dist = float(np.linalg.norm(pts[16] - pts[30]))
+    yaw_asym = abs(left_dist - right_dist) / jaw_w
+    return mar, yaw_asym
+
+
+def estimate_mouth_cavity_darkness(face_bgr):
+    """Estimate mouth openness via dark-cavity pixel ratio inside the mouth ROI.
+
+    Used as a zero-model CPU fallback for ``ref_frame_mode="auto"`` when cached
+    bounding boxes are reused without saved 68-point landmarks.
+
+    Args:
+        face_bgr (np.ndarray): Cropped face image, ``(H, W, 3)`` in BGR order.
+
+    Returns:
+        float: Fraction in ``[0, 1]`` of mouth-ROI pixels darker than 55% of the
+            80th-percentile skin luma; lower implies a more closed mouth.
+    """
+    if face_bgr is None or getattr(face_bgr, "ndim", 0) != 3 or face_bgr.shape[2] != 3:
+        return 1.0
+    h, w = face_bgr.shape[:2]
+    y1, y2 = int(h * 0.56), int(h * 0.86)
+    x1, x2 = int(w * 0.22), int(w * 0.78)
+    if y2 <= y1 or x2 <= x1:
+        return 1.0
+    roi = face_bgr[y1:y2, x1:x2].astype(np.float32)
+    luma = roi[:, :, 0] * 0.114 + roi[:, :, 1] * 0.587 + roi[:, :, 2] * 0.299
+    skin_ref = float(np.percentile(luma, 80))
+    if skin_ref < 1e-5:
+        return 1.0
+    return float(np.mean(luma < 0.55 * skin_ref))
+
+
+def select_auto_ref_frame_index(
+    coord_list,
+    landmarks_list=None,
+    mouth_darkness_scores=None,
+    placeholder=(0.0, 0.0, 0.0, 0.0),
+):
+    """Pick the best closed-mouth, front-facing, median-pose reference frame.
+
+    Args:
+        coord_list (list): Per-frame face bounding boxes ``[x1, y1, x2, y2]``.
+        landmarks_list (list | None): Optional per-frame ``(68, 2)`` landmarks
+            from DWPose. When valid entries exist, selection uses
+            ``3.0 * mar + 1.0 * yaw_asym + 0.5 * pose_dev``.
+        mouth_darkness_scores (list | None): Optional per-frame dark-cavity ratios
+            from :func:`estimate_mouth_cavity_darkness` used when landmarks are
+            unavailable (e.g. ``--use_saved_coord``).
+        placeholder (tuple): Sentinel value marking missing face detections.
+
+    Returns:
+        int: Selected frame index in ``[0, len(coord_list))`` (or ``0`` if empty).
+    """
+    valid_indices = []
+    boxes = []
+    for idx, bbox in enumerate(coord_list):
+        if bbox is None or tuple(bbox) == tuple(placeholder):
+            continue
+        x1, y1, x2, y2 = bbox
+        if (x2 - x1) > 0 and (y2 - y1) > 0:
+            valid_indices.append(idx)
+            boxes.append((float(x1), float(y1), float(x2), float(y2)))
+
+    if not valid_indices:
+        return 0
+    if len(valid_indices) == 1:
+        return valid_indices[0]
+
+    arr = np.asarray(boxes, dtype=np.float32)
+    cxs = 0.5 * (arr[:, 0] + arr[:, 2])
+    cys = 0.5 * (arr[:, 1] + arr[:, 3])
+    ws = np.maximum(arr[:, 2] - arr[:, 0], 1.0)
+    hs = np.maximum(arr[:, 3] - arr[:, 1], 1.0)
+    med_cx, med_cy = float(np.median(cxs)), float(np.median(cys))
+    med_w, med_h = float(np.median(ws)), float(np.median(hs))
+
+    pose_dev = {}
+    for pos, idx in enumerate(valid_indices):
+        pose_dev[idx] = (
+            abs(float(cxs[pos]) - med_cx) / med_w
+            + abs(float(cys[pos]) - med_cy) / med_h
+            + abs(float(ws[pos]) - med_w) / med_w
+            + abs(float(hs[pos]) - med_h) / med_h
+        )
+
+    # Primary path: DWPose 68-point landmarks (mouth closedness + frontal yaw + median pose)
+    if landmarks_list is not None and len(landmarks_list) == len(coord_list):
+        landmark_candidates = []
+        for idx in valid_indices:
+            scored = score_landmark_neutral_ref(landmarks_list[idx])
+            if scored is not None:
+                mar, yaw_asym = scored
+                total = 3.0 * mar + 1.0 * yaw_asym + 0.5 * pose_dev[idx]
+                landmark_candidates.append((total, idx))
+        if landmark_candidates:
+            landmark_candidates.sort(key=lambda item: (item[0], item[1]))
+            return landmark_candidates[0][1]
+
+    # Fallback path: CPU image darkness ratio (e.g., --use_saved_coord legacy .pkl)
+    if mouth_darkness_scores is not None and len(mouth_darkness_scores) == len(coord_list):
+        dark_candidates = []
+        for idx in valid_indices:
+            dark = mouth_darkness_scores[idx]
+            if dark is not None and np.isfinite(dark):
+                total = 3.0 * float(dark) + 0.5 * pose_dev[idx]
+                dark_candidates.append((total, idx))
+        if dark_candidates:
+            dark_candidates.sort(key=lambda item: (item[0], item[1]))
+            return dark_candidates[0][1]
+
+    return min(valid_indices, key=lambda idx: (pose_dev[idx], idx))
+
+
+def rebind_ref_latents(input_latent_list, ref_frame_mode="self", ref_frame_index=None):
+    """Replace the reference-half channels of concatenated UNet latents.
+
+    ``VAE.get_latents_for_unet`` concatenates ``[masked_latents, ref_latents]``
+    along channel dimension 1. Keeping ``ref_frame_mode="self"`` returns
+    ``input_latent_list`` unchanged; ``"first"``, ``"offset"``, and ``"auto"``
+    pair each frame's masked latent with another frame's reference latent so a
+    speaking template video does not leak its original mouth state into
+    cross-driven generation.
+
+    Args:
+        input_latent_list (list): Sequence of 4-D ``(B, 2*C, H, W)`` tensors or
+            NumPy arrays, one per unique source frame.
+        ref_frame_mode (str): One of :data:`REF_FRAME_MODES`.
+        ref_frame_index (int | None): Pre-selected frame index used when
+            ``ref_frame_mode == "auto"`` (defaults to ``0`` if ``None``).
+
+    Returns:
+        list: Original list when ``ref_frame_mode == "self"`` or fewer than two
+            frames are present; otherwise a new list with rebound reference halves.
+
+    Raises:
+        ValueError: If ``ref_frame_mode`` is invalid, ``ref_frame_index`` is out
+            of bounds, or any latent lacks an even channel count on axis 1.
+    """
+    validated_mode = validate_ref_frame_mode(ref_frame_mode)
+    num_frames = len(input_latent_list)
+    if validated_mode == "self" or num_frames <= 1:
+        return input_latent_list
+
+    sample = input_latent_list[0]
+    if getattr(sample, "ndim", None) != 4 or sample.shape[1] < 2 or sample.shape[1] % 2 != 0:
+        raise ValueError(
+            f"Expected 4-D latents with even channel count >= 2, got shape {getattr(sample, 'shape', None)}"
+        )
+    half_channels = sample.shape[1] // 2
+    is_numpy = isinstance(sample, np.ndarray)
+    cat_fn = None if is_numpy else __import__("torch").cat
+    auto_idx = 0 if ref_frame_index is None else int(ref_frame_index)
+
+    rebound = []
+    for idx in range(num_frames):
+        ref_idx = resolve_ref_frame_index(
+            idx,
+            num_frames,
+            mode=validated_mode,
+            auto_ref_index=auto_idx,
+        )
+        masked_half = input_latent_list[idx][:, :half_channels]
+        ref_half = input_latent_list[ref_idx][:, half_channels:]
+        if is_numpy:
+            rebound.append(np.concatenate([masked_half, ref_half], axis=1))
+        else:
+            rebound.append(cat_fn([masked_half, ref_half], dim=1))
+    return rebound
 
 
 def validate_resolution(resolution):

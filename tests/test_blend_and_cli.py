@@ -122,26 +122,42 @@ class RunCliPassThroughTest(unittest.TestCase):
         self.assertEqual(opts["--use_audio_pe"], "true")
 
     def test_resolution_512_selects_512_weights_and_disables_audio_pe_by_default(self):
-        """Passing --resolution 512 routes to musetalkV15_512 and use_audio_pe=false."""
+        """Passing --resolution 512 routes to musetalkV15_512, use_audio_pe=false, ref_frame_mode=auto."""
         opts = self._run(["--resolution", "512"])
         self.assertEqual(opts["--resolution"], "512")
         self.assertEqual(opts["--version"], "v15")
         self.assertEqual(opts["--unet_model_path"], "./models/musetalkV15_512/unet.pth")
         self.assertEqual(opts["--unet_config"], "./models/musetalkV15_512/musetalk.json")
         self.assertEqual(opts["--use_audio_pe"], "false")
+        self.assertEqual(opts["--ref_frame_mode"], "auto")
 
     def test_resolution_512_respects_explicit_model_and_audio_pe_overrides(self):
-        """Explicit UNet path, config, and use_audio_pe flags override defaults."""
+        """Explicit UNet path, config, use_audio_pe, and ref_frame_mode flags override defaults."""
         opts = self._run([
             "--resolution", "512",
             "--unet_model_path", "/tmp/custom_512.pth",
             "--unet_config", "/tmp/custom.json",
             "--use_audio_pe", "true",
+            "--ref_frame_mode", "first",
         ])
         self.assertEqual(opts["--resolution"], "512")
         self.assertEqual(opts["--unet_model_path"], "/tmp/custom_512.pth")
         self.assertEqual(opts["--unet_config"], "/tmp/custom.json")
         self.assertEqual(opts["--use_audio_pe"], "true")
+        self.assertEqual(opts["--ref_frame_mode"], "first")
+
+    def test_ref_frame_mode_default_and_override(self):
+        """run_cli defaults --ref_frame_mode to self for 256, auto for 512, and forwards explicit modes."""
+        default_256 = self._run([])
+        self.assertEqual(default_256["--ref_frame_mode"], "self")
+        default_512 = self._run(["--resolution", "512"])
+        self.assertEqual(default_512["--ref_frame_mode"], "auto")
+        offset_opts = self._run(["--resolution", "512", "--ref_frame_mode", "offset"])
+        self.assertEqual(offset_opts["--ref_frame_mode"], "offset")
+        self_opts = self._run(["--resolution", "512", "--ref_frame_mode", "self"])
+        self.assertEqual(self_opts["--ref_frame_mode"], "self")
+        auto_256 = self._run(["--ref_frame_mode", "auto"])
+        self.assertEqual(auto_256["--ref_frame_mode"], "auto")
 
     def test_v10_rejects_512_without_explicit_weights(self):
         """v1.0 with --resolution 512 fails fast unless explicit UNet files are supplied."""
