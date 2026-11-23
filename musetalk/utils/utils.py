@@ -10,6 +10,7 @@ import os.path as osp
 
 from musetalk.models.vae import VAE
 from musetalk.models.unet import UNet,PositionalEncoding
+from musetalk.utils.clarity import validate_resolution
 
 
 def load_all_model(
@@ -18,14 +19,18 @@ def load_all_model(
     unet_config=os.path.join("models", "musetalkV15", "musetalk.json"),
     device=None,
     vae_latent_mode="sample",
+    resolution=256,
 ):
     """Load the VAE, UNet and audio positional encoding used for inference.
 
     Args:
         vae_latent_mode (str): ``"sample"`` (legacy) or ``"mode"`` for VAE encoding.
+        resolution (int): Square generation resolution in pixels (``256`` or ``512``).
     """
+    resolution = validate_resolution(resolution)
     vae = VAE(
         model_path = os.path.join("models", vae_type),
+        resized_img=resolution,
         latent_mode=vae_latent_mode,
     )
     print(f"load unet model from {unet_model_path}")

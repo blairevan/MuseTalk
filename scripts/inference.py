@@ -37,10 +37,12 @@ from musetalk.utils.audio_utils import (
 from musetalk.utils.clarity import (
     ENHANCE_MODES,
     PASTE_INTERPOLATION_MODES,
+    SUPPORTED_RESOLUTIONS,
     blend_faces,
     correct_teeth_whiteness,
     resize_generated_face,
     sharpen_lip_region,
+    validate_resolution,
 )
 from musetalk.utils.frame_io import FrameSequence
 from musetalk.utils.resource_utils import release_torch_resources
@@ -120,7 +122,12 @@ def enhance_generated_face(face, args, fp):
             print(f"Warning: mouth parsing failed, skipping teeth correction: {e}")
         face = correct_teeth_whiteness(face, mouth_mask)
     if args.enhance_mode == "usm":
-        face = sharpen_lip_region(face, amount_override=args.usm_amount)
+        generated_size = validate_resolution(getattr(args, "resolution", 256))
+        face = sharpen_lip_region(
+            face,
+            amount_override=args.usm_amount,
+            generated_size=generated_size,
+        )
     return face
 
 @torch.no_grad()
@@ -134,6 +141,9 @@ def main(args):
         if not fast_check_ffmpeg():
             print("Warning: Unable to find ffmpeg, please ensure ffmpeg is properly installed")
     
+    # Validate generation resolution before loading any models
+    resolution = validate_resolution(getattr(args, "resolution", 256))
+
     # Set computing device
     device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
     
@@ -263,6 +273,7 @@ def main(args):
                 unet_config=args.unet_config,
                 device=device,
                 vae_latent_mode=args.vae_latent_mode,
+                resolution=resolution,
             )
             timesteps = torch.tensor([0], device=device)
 
@@ -358,7 +369,11 @@ def main(args):
                         y2 = min(y2, frame.shape[0])
                     crop_frame = frame[y1:y2, x1:x2]
                     try:
-                        crop_frame = cv2.resize(crop_frame, (256,256), interpolation=cv2.INTER_LANCZOS4)
+                        crop_frame = cv2.resize(
+                            crop_frame,
+                            (resolution, resolution),
+                            interpolation=cv2.INTER_LANCZOS4,
+                        )
                         first_valid_latents = vae.get_latents_for_unet(crop_frame)
                         first_valid_bbox = bbox
                         break
@@ -368,7 +383,7 @@ def main(args):
             # Absolute fallback if no valid face is found at all
             if first_valid_bbox is None:
                 first_valid_bbox = [0, 0, 100, 100]
-                dummy = np.zeros((256, 256, 3), dtype=np.uint8)
+                dummy = np.zeros((resolution, resolution, 3), dtype=np.uint8)
                 first_valid_latents = vae.get_latents_for_unet(dummy)
 
             last_valid_bbox = first_valid_bbox
@@ -397,7 +412,11 @@ def main(args):
                 
                 crop_frame = frame[y1:y2, x1:x2]
                 try:
-                    crop_frame = cv2.resize(crop_frame, (256,256), interpolation=cv2.INTER_LANCZOS4)
+                    crop_frame = cv2.resize(
+                        crop_frame,
+                        (resolution, resolution),
+                        interpolation=cv2.INTER_LANCZOS4,
+                    )
                     latents = vae.get_latents_for_unet(crop_frame)
                     last_valid_bbox = bbox
                     last_valid_latents = latents
@@ -666,6 +685,8 @@ if __name__ == "__main__":
     parser.add_argument("--close_mouth_start", type=parse_bool, default=True, help="Close mouth during leading silence (true/false)")
     parser.add_argument("--close_mouth_end", type=parse_bool, default=False, help="Close mouth during trailing silence (true/false)")
     parser.add_argument("--version", type=str, default="v15", choices=["v1", "v15"], help="Model version to use")
+    parser.add_argument("--resolution", type=int, default=256, choices=list(SUPPORTED_RESOLUTIONS),
+                        help="UNet/VAE generation resolution in pixels (256 legacy or 512 high-resolution)")
     # Clarity options. The first four defaults were adopted after 4K A/B runs on
     # an RTX 5070; pass the legacy values to reproduce the previous output.
     parser.add_argument("--vae_latent_mode", type=str, default="mode", choices=["sample", "mode"],

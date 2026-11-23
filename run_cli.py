@@ -6,6 +6,61 @@ import yaml
 import subprocess
 
 from musetalk.utils.audio_utils import parse_bool
+from musetalk.utils.clarity import SUPPORTED_RESOLUTIONS, validate_resolution
+
+
+def resolve_model_settings(
+    model_version,
+    resolution,
+    unet_model_path=None,
+    unet_config=None,
+    use_audio_pe=None,
+):
+    """Resolve model checkpoint paths, version flag, and audio PE default.
+
+    Args:
+        model_version (str): CLI model version (``"v1.0"`` or ``"v1.5"``).
+        resolution (int): Generation resolution in pixels (``256`` or ``512``).
+        unet_model_path (str | None): Explicit UNet weights path override.
+        unet_config (str | None): Explicit UNet config JSON path override.
+        use_audio_pe (bool | None): Explicit audio PE flag, or ``None`` to pick
+            the resolution default (``True`` for 256, ``False`` for 512).
+
+    Returns:
+        dict: Mapping with ``unet_model_path``, ``unet_config``, ``version_arg``,
+            ``resolution``, and ``use_audio_pe``.
+
+    Raises:
+        ValueError: If ``resolution`` is unsupported or ``v1.0`` is paired with
+            ``resolution=512`` without explicit UNet path overrides.
+    """
+    resolved_resolution = validate_resolution(resolution)
+    if model_version == "v1.0":
+        if resolved_resolution != 256 and not (unet_model_path and unet_config):
+            raise ValueError(
+                "model_version 'v1.0' only ships with 256px weights; "
+                "use --model_version v1.5 or pass explicit --unet_model_path and --unet_config."
+            )
+        default_unet = "./models/musetalk/pytorch_model.bin"
+        default_cfg = "./models/musetalk/musetalk.json"
+        version_arg = "v1"
+    elif resolved_resolution == 512:
+        default_unet = "./models/musetalkV15_512/unet.pth"
+        default_cfg = "./models/musetalkV15_512/musetalk.json"
+        version_arg = "v15"
+    else:
+        default_unet = "./models/musetalkV15/unet.pth"
+        default_cfg = "./models/musetalkV15/musetalk.json"
+        version_arg = "v15"
+
+    resolved_audio_pe = (resolved_resolution == 256) if use_audio_pe is None else bool(use_audio_pe)
+    return {
+        "unet_model_path": unet_model_path or default_unet,
+        "unet_config": unet_config or default_cfg,
+        "version_arg": version_arg,
+        "resolution": resolved_resolution,
+        "use_audio_pe": resolved_audio_pe,
+    }
 
 def validate_inputs(face_path, audio_path):
     # Check if face_path exists and is non-empty
@@ -72,6 +127,12 @@ def main():
     parser.add_argument("--audio", type=str, required=True, help="Input audio path")
     parser.add_argument("--outfile", type=str, required=True, help="Output video path (must be a specific .mp4 file)")
     parser.add_argument("--model_version", type=str, default="v1.5", choices=["v1.0", "v1.5"])
+    parser.add_argument("--resolution", type=int, default=256, choices=list(SUPPORTED_RESOLUTIONS),
+                        help="UNet/VAE generation resolution in pixels (256 legacy or 512 high-resolution)")
+    parser.add_argument("--unet_model_path", type=str, default=None,
+                        help="Optional override path for UNet weights")
+    parser.add_argument("--unet_config", type=str, default=None,
+                        help="Optional override path for UNet config JSON")
     parser.add_argument("--bbox_shift", type=int, default=0, help="Bounding box vertical shift in pixels")
     parser.add_argument("--extra_margin", type=int, default=8, help="Extra margin for face cropping")
     parser.add_argument("--bbox_left_ratio", type=float, default=0.0, help="Left bbox adjust ratio; positive expands, negative shrinks")
@@ -106,8 +167,8 @@ def main():
     parser.add_argument("--pause_min_frames", type=int, default=8, help="Shortest pause, in frames, that closes the mouth")
     parser.add_argument("--pause_fade_frames", type=int, default=4, help="Frames used to fade into and out of a pause")
     parser.add_argument("--pause_top_db", type=float, default=38.0, help="Silence threshold below the audio peak, in dB")
-    parser.add_argument("--use_audio_pe", type=parse_bool, default=True,
-                        help="Add positional encoding to Whisper features (legacy true)")
+    parser.add_argument("--use_audio_pe", type=parse_bool, default=None,
+                        help="Add positional encoding to Whisper features (default: true for 256, false for 512)")
     
     args = parser.parse_args()
 
@@ -139,15 +200,18 @@ def main():
     out_dir = os.path.dirname(outfile_path)
     os.makedirs(out_dir, exist_ok=True)
 
-    # 根据选定的版本，自动组装底层的模型路径
-    if args.model_version == "v1.0":
-        unet_model_path = "./models/musetalk/pytorch_model.bin"
-        unet_config = "./models/musetalk/musetalk.json"
-        version_arg = "v1"
-    else:
-        unet_model_path = "./models/musetalkV15/unet.pth"
-        unet_config = "./models/musetalkV15/musetalk.json"
-        version_arg = "v15"
+    # Resolve UNet weights, config, resolution, and audio PE settings
+    try:
+        model_settings = resolve_model_settings(
+            args.model_version,
+            args.resolution,
+            unet_model_path=args.unet_model_path,
+            unet_config=args.unet_config,
+            use_audio_pe=args.use_audio_pe,
+        )
+    except ValueError as err:
+        print(f"❌ 错误: {err}")
+        sys.exit(1)
 
     # 组装最终的底层调用命令
     cmd = [
@@ -155,9 +219,10 @@ def main():
         "--inference_config", temp_yaml,
         "--result_dir", out_dir,
         "--output_vid_name", outfile_path,  # 传入绝对路径，底层代码 os.path.join 遇到绝对路径会自动使用绝对路径
-        "--unet_model_path", unet_model_path,
-        "--unet_config", unet_config,
-        "--version", version_arg,
+        "--unet_model_path", model_settings["unet_model_path"],
+        "--unet_config", model_settings["unet_config"],
+        "--version", model_settings["version_arg"],
+        "--resolution", str(model_settings["resolution"]),
         "--bbox_shift", str(args.bbox_shift),
         "--extra_margin", str(args.extra_margin),
         "--bbox_left_ratio", str(args.bbox_left_ratio),
@@ -182,7 +247,7 @@ def main():
         "--pause_min_frames", str(args.pause_min_frames),
         "--pause_fade_frames", str(args.pause_fade_frames),
         "--pause_top_db", str(args.pause_top_db),
-        "--use_audio_pe", str(args.use_audio_pe).lower(),
+        "--use_audio_pe", str(model_settings["use_audio_pe"]).lower(),
     ]
     if args.use_float16:
         cmd.append("--use_float16")

@@ -25,6 +25,8 @@ class VAE():
         """
         if latent_mode not in ("sample", "mode"):
             raise ValueError(f"Unknown VAE latent mode: {latent_mode}")
+        if isinstance(resized_img, bool) or not isinstance(resized_img, int) or resized_img <= 0:
+            raise ValueError(f"resized_img must be a positive integer, got {resized_img!r}")
         self.latent_mode = latent_mode
         self.model_path = model_path
         self.vae = AutoencoderKL.from_pretrained(self.model_path)
@@ -73,6 +75,12 @@ class VAE():
                 window.append(img)
         else:
             img = cv2.cvtColor(img_name, cv2.COLOR_BGR2RGB)
+            if img.shape[:2] != (self._resized_img, self._resized_img):
+                img = cv2.resize(
+                    img,
+                    (self._resized_img, self._resized_img),
+                    interpolation=cv2.INTER_LANCZOS4,
+                )
             window.append(img)
             
         x = np.asarray(window) / 255.
@@ -82,7 +90,7 @@ class VAE():
             x = x * (self._mask_tensor>0.5)
         x = self.transform(x)
         
-        x = x.unsqueeze(0) # [1, 3, 256, 256] torch tensor
+        x = x.unsqueeze(0) # [1, 3, H, W] torch tensor
         x = x.to(self.vae.device)
 
         return x

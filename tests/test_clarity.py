@@ -107,6 +107,40 @@ class UsmTest(unittest.TestCase):
         small = np.random.default_rng(0).integers(0, 255, (200, 200, 3), dtype=np.uint8)
         self.assertIs(clarity.sharpen_lip_region(small), small)
 
+    def test_512_generated_size_scales_usm_correctly(self):
+        """At native 512, 480px boxes skip USM and 600px boxes sharpen more gently than at 256."""
+        self.assertIsNone(clarity.compute_usm_params(480, 480, generated_size=512))
+        self.assertIsNotNone(clarity.compute_usm_params(480, 480, generated_size=256))
+        params_256 = clarity.compute_usm_params(600, 600, generated_size=256)
+        params_512 = clarity.compute_usm_params(600, 600, generated_size=512)
+        self.assertLess(params_512[0], params_256[0])
+        self.assertLess(params_512[1], params_256[1])
+        face_480 = np.random.default_rng(1).integers(0, 255, (480, 480, 3), dtype=np.uint8)
+        self.assertIs(clarity.sharpen_lip_region(face_480, generated_size=512), face_480)
+        with self.assertRaises(ValueError):
+            clarity.compute_usm_params(512, 512, generated_size=0)
+
+
+class ResolutionValidationTest(unittest.TestCase):
+    """Validation of inference generation resolutions and realtime cache matching."""
+
+    def test_validate_resolution_accepts_256_and_512_only(self):
+        """Only integer 256 and 512 are valid generation resolutions."""
+        self.assertEqual(clarity.validate_resolution(256), 256)
+        self.assertEqual(clarity.validate_resolution(512), 512)
+        for bad in (True, False, 0, 128, 384, 1024, "512", 512.0, None):
+            with self.assertRaises(ValueError):
+                clarity.validate_resolution(bad)
+
+    def test_cached_avatar_resolution_guard(self):
+        """Legacy caches default to 256 and cross-resolution reuse fails fast."""
+        clarity.validate_cached_avatar_resolution("av1", {}, 256)
+        clarity.validate_cached_avatar_resolution("av1", {"resolution": 512}, 512)
+        with self.assertRaises(ValueError):
+            clarity.validate_cached_avatar_resolution("av1", {}, 512)
+        with self.assertRaises(ValueError):
+            clarity.validate_cached_avatar_resolution("av1", {"resolution": 512}, 256)
+
 
 class TeethCorrectionTest(unittest.TestCase):
     """Mouth-interior brightness correction."""

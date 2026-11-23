@@ -109,6 +109,9 @@ class RunCliPassThroughTest(unittest.TestCase):
     def test_defaults_use_adopted_clarity_settings(self):
         """The four A/B-approved options are on; experimental ones stay off."""
         opts = self._run([])
+        self.assertEqual(opts["--resolution"], "256")
+        self.assertEqual(opts["--unet_model_path"], "./models/musetalkV15/unet.pth")
+        self.assertEqual(opts["--unet_config"], "./models/musetalkV15/musetalk.json")
         self.assertEqual(opts["--vae_latent_mode"], "mode")
         self.assertEqual(opts["--paste_interpolation"], "lanczos")
         self.assertEqual(opts["--enhance_mode"], "usm")
@@ -117,6 +120,40 @@ class RunCliPassThroughTest(unittest.TestCase):
         self.assertEqual(opts["--close_mouth_pauses"], "false")
         self.assertEqual(opts["--pause_top_db"], "38.0")
         self.assertEqual(opts["--use_audio_pe"], "true")
+
+    def test_resolution_512_selects_512_weights_and_disables_audio_pe_by_default(self):
+        """Passing --resolution 512 routes to musetalkV15_512 and use_audio_pe=false."""
+        opts = self._run(["--resolution", "512"])
+        self.assertEqual(opts["--resolution"], "512")
+        self.assertEqual(opts["--version"], "v15")
+        self.assertEqual(opts["--unet_model_path"], "./models/musetalkV15_512/unet.pth")
+        self.assertEqual(opts["--unet_config"], "./models/musetalkV15_512/musetalk.json")
+        self.assertEqual(opts["--use_audio_pe"], "false")
+
+    def test_resolution_512_respects_explicit_model_and_audio_pe_overrides(self):
+        """Explicit UNet path, config, and use_audio_pe flags override defaults."""
+        opts = self._run([
+            "--resolution", "512",
+            "--unet_model_path", "/tmp/custom_512.pth",
+            "--unet_config", "/tmp/custom.json",
+            "--use_audio_pe", "true",
+        ])
+        self.assertEqual(opts["--resolution"], "512")
+        self.assertEqual(opts["--unet_model_path"], "/tmp/custom_512.pth")
+        self.assertEqual(opts["--unet_config"], "/tmp/custom.json")
+        self.assertEqual(opts["--use_audio_pe"], "true")
+
+    def test_v10_rejects_512_without_explicit_weights(self):
+        """v1.0 with --resolution 512 fails fast unless explicit UNet files are supplied."""
+        import run_cli
+
+        with self.assertRaises(ValueError):
+            run_cli.resolve_model_settings("v1.0", 512)
+        resolved = run_cli.resolve_model_settings(
+            "v1.0", 512, unet_model_path="/tmp/u.pth", unet_config="/tmp/c.json"
+        )
+        self.assertEqual(resolved["resolution"], 512)
+        self.assertEqual(resolved["unet_model_path"], "/tmp/u.pth")
 
     def test_legacy_values_are_forwarded(self):
         """Explicit legacy values reach scripts.inference unchanged."""

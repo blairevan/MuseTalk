@@ -12,9 +12,52 @@ import numpy as np
 
 PASTE_INTERPOLATION_MODES = ("linear", "lanczos")
 ENHANCE_MODES = ("none", "usm")
+SUPPORTED_RESOLUTIONS = (256, 512)
 
-# Generated faces are decoded at this size before being pasted back.
+# Legacy generated face size before pasting back.
 _GENERATED_FACE_SIZE = 256.0
+
+
+def validate_resolution(resolution):
+    """Validate an inference generation resolution.
+
+    Args:
+        resolution (int): Target square generation size in pixels.
+
+    Returns:
+        int: Validated resolution (``256`` or ``512``).
+
+    Raises:
+        ValueError: If ``resolution`` is a boolean or not in
+            :data:`SUPPORTED_RESOLUTIONS`.
+    """
+    if isinstance(resolution, bool) or not isinstance(resolution, int) or resolution not in SUPPORTED_RESOLUTIONS:
+        raise ValueError(
+            f"Unsupported resolution {resolution!r}; expected one of {SUPPORTED_RESOLUTIONS}"
+        )
+    return resolution
+
+
+def validate_cached_avatar_resolution(avatar_id, cached_info, current_resolution):
+    """Ensure a cached realtime avatar's latents match the active resolution.
+
+    Args:
+        avatar_id (str): Identifier of the cached avatar.
+        cached_info (dict): Metadata loaded from ``avator_info.json``; older
+            caches without a ``resolution`` field default to ``256``.
+        current_resolution (int): Active inference resolution (``256`` or ``512``).
+
+    Raises:
+        ValueError: If the cached resolution differs from ``current_resolution``.
+    """
+    expected = validate_resolution(current_resolution)
+    cached_res = cached_info.get("resolution", 256)
+    if cached_res != expected:
+        raise ValueError(
+            f"Cached avatar '{avatar_id}' was prepared at resolution={cached_res}, "
+            f"which is incompatible with --resolution {expected}; "
+            "re-create the avatar with preparation=True."
+        )
 
 # BT.601 luma weights in BGR channel order.
 _LUMA_WEIGHTS_BGR = np.array([0.114, 0.587, 0.299], dtype=np.float32)
@@ -136,19 +179,25 @@ def gaussian_blur_2d(image, sigma):
     return _blur_axis(_blur_axis(image, kernel, axis=1), kernel, axis=0)
 
 
-def compute_usm_params(face_w, face_h, amount_override=-1.0):
+def compute_usm_params(face_w, face_h, amount_override=-1.0, generated_size=_GENERATED_FACE_SIZE):
     """Choose unsharp-mask strength from how much the generated face is enlarged.
 
     Args:
         face_w (int): Destination face-box width.
         face_h (int): Destination face-box height.
         amount_override (float): Fixed amount when ``>= 0``; negative means auto.
+        generated_size (float): Native square generation resolution (e.g. 256 or 512).
 
     Returns:
         tuple[float, float] | None: ``(amount, sigma)``, or ``None`` when the
         face is not enlarged enough for sharpening to help.
+
+    Raises:
+        ValueError: If ``generated_size`` is not positive.
     """
-    scale = max(int(face_w), int(face_h)) / _GENERATED_FACE_SIZE
+    if generated_size <= 0:
+        raise ValueError(f"generated_size must be positive, got {generated_size}")
+    scale = max(int(face_w), int(face_h)) / float(generated_size)
     if scale <= 0.95:
         return None
     if amount_override is not None and amount_override >= 0:
@@ -183,7 +232,7 @@ def mouth_ellipse_weight(height, width, inner_ratio=0.6):
     return (0.5 * (1.0 + np.cos(np.pi * fade))).astype(np.float32)
 
 
-def sharpen_lip_region(face_bgr, amount_override=-1.0, threshold=3.0):
+def sharpen_lip_region(face_bgr, amount_override=-1.0, threshold=3.0, generated_size=_GENERATED_FACE_SIZE):
     """Sharpen the lip and teeth area of a pasted face on its luma channel.
 
     Sharpening only luma and adding the same delta to all channels avoids the
@@ -194,12 +243,13 @@ def sharpen_lip_region(face_bgr, amount_override=-1.0, threshold=3.0):
         face_bgr (np.ndarray): ``uint8`` BGR face already resized to the face box.
         amount_override (float): Fixed amount when ``>= 0``; negative means auto.
         threshold (float): Luma detail below this magnitude is ignored.
+        generated_size (float): Native square generation resolution (e.g. 256 or 512).
 
     Returns:
         np.ndarray: Sharpened ``uint8`` face, or the input when skipped.
     """
     height, width = face_bgr.shape[:2]
-    params = compute_usm_params(width, height, amount_override)
+    params = compute_usm_params(width, height, amount_override, generated_size=generated_size)
     if params is None:
         return face_bgr
     amount, sigma = params

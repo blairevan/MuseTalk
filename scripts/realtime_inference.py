@@ -30,7 +30,13 @@ from musetalk.utils.mask_utils import adjust_face_box
 from musetalk.utils.utils import load_all_model, get_video_fps, get_file_type
 from musetalk.utils.audio_processor import AudioProcessor
 from musetalk.utils.audio_utils import build_audio_mux_command, parse_bool
-from musetalk.utils.clarity import PASTE_INTERPOLATION_MODES, resize_generated_face
+from musetalk.utils.clarity import (
+    PASTE_INTERPOLATION_MODES,
+    SUPPORTED_RESOLUTIONS,
+    resize_generated_face,
+    validate_cached_avatar_resolution,
+    validate_resolution,
+)
 from musetalk.utils.sequence_utils import build_ping_pong_cycle
 
 import shutil
@@ -93,6 +99,7 @@ class Avatar:
             "video_path": video_path,
             "bbox_shift": bbox_shift,
             "version": args.version,
+            "resolution": args.resolution,
             "mask_blur_ratio": args.mask_blur_ratio,
             "protect_upper_face": args.protect_upper_face,
             "vae_latent_mode": args.vae_latent_mode,
@@ -101,6 +108,14 @@ class Avatar:
         self.batch_size = batch_size
         self.idx = 0
         self.init()
+
+    def validate_cached_resolution(self, cached_info):
+        """Reject reusing cached latents prepared for a different resolution."""
+        validate_cached_avatar_resolution(
+            self.avatar_id,
+            cached_info,
+            self.avatar_info["resolution"],
+        )
 
     def warn_on_cached_settings(self, cached_info):
         """Warn when a reused avatar was prepared with different mask or latent settings.
@@ -135,7 +150,9 @@ class Avatar:
                 else:
                     if os.path.exists(self.avatar_info_path):
                         with open(self.avatar_info_path, "r") as f:
-                            self.warn_on_cached_settings(json.load(f))
+                            cached_info = json.load(f)
+                            self.validate_cached_resolution(cached_info)
+                            self.warn_on_cached_settings(cached_info)
                     self.input_latent_list_cycle = torch.load(self.latents_out_path, weights_only=False)
                     with open(self.coords_path, 'rb') as f:
                         self.coord_list_cycle = pickle.load(f)
@@ -161,6 +178,7 @@ class Avatar:
             with open(self.avatar_info_path, "r") as f:
                 avatar_info = json.load(f)
 
+            self.validate_cached_resolution(avatar_info)
             self.warn_on_cached_settings(avatar_info)
 
             if avatar_info['bbox_shift'] != self.avatar_info['bbox_shift']:
@@ -227,7 +245,11 @@ class Avatar:
                     y2 = min(y2, frame.shape[0])
                 crop_frame = frame[y1:y2, x1:x2]
                 try:
-                    crop_frame = cv2.resize(crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
+                    crop_frame = cv2.resize(
+                        crop_frame,
+                        (args.resolution, args.resolution),
+                        interpolation=cv2.INTER_LANCZOS4,
+                    )
                     first_valid_latents = vae.get_latents_for_unet(crop_frame)
                     first_valid_bbox = bbox
                     break
@@ -236,7 +258,7 @@ class Avatar:
         
         if first_valid_bbox is None:
             first_valid_bbox = [0, 0, 100, 100]
-            dummy = np.zeros((256, 256, 3), dtype=np.uint8)
+            dummy = np.zeros((args.resolution, args.resolution, 3), dtype=np.uint8)
             first_valid_latents = vae.get_latents_for_unet(dummy)
 
         last_valid_bbox = first_valid_bbox
@@ -264,7 +286,11 @@ class Avatar:
                 
             crop_frame = frame[y1:y2, x1:x2]
             try:
-                resized_crop_frame = cv2.resize(crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4)
+                resized_crop_frame = cv2.resize(
+                    crop_frame,
+                    (args.resolution, args.resolution),
+                    interpolation=cv2.INTER_LANCZOS4,
+                )
                 latents = vae.get_latents_for_unet(resized_crop_frame)
                 last_valid_bbox = coord_list[idx]
                 last_valid_latents = latents
@@ -451,6 +477,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--version", type=str, default="v15", choices=["v1", "v15"], help="Version of MuseTalk: v1 or v15")
+    parser.add_argument("--resolution", type=int, default=256, choices=list(SUPPORTED_RESOLUTIONS),
+                        help="UNet/VAE generation resolution in pixels (256 legacy or 512 high-resolution)")
     parser.add_argument("--ffmpeg_path", type=str, default="./ffmpeg-4.4-amd64-static/", help="Path to ffmpeg executable")
     parser.add_argument("--gpu_id", type=int, default=0, help="GPU ID to use")
     parser.add_argument("--vae_type", type=str, default="sd-vae", help="Type of VAE model")
@@ -494,6 +522,7 @@ if __name__ == "__main__":
                         help="Add positional encoding to Whisper features (legacy true)")
 
     args = parser.parse_args()
+    args.resolution = validate_resolution(args.resolution)
 
     # Configure ffmpeg path
     if not fast_check_ffmpeg():
@@ -514,6 +543,7 @@ if __name__ == "__main__":
         unet_config=args.unet_config,
         device=device,
         vae_latent_mode=args.vae_latent_mode,
+        resolution=args.resolution,
     )
     timesteps = torch.tensor([0], device=device)
 
