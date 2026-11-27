@@ -478,7 +478,19 @@ def plan_reference_frame_mode(
             "p95_mar": None,
         }
 
-    if validated_mode == "auto":
+    valid_lm_count = sum(
+        1 for lm in landmarks_list if score_landmark_neutral_ref(lm) is not None
+    )
+    if valid_lm_count < 2:
+        return {
+            "effective_mode": validated_mode,
+            "auto_ref_idx": None,
+            "use_landmark_align": False,
+            "closed_template": False,
+            "p95_mar": None,
+        }
+
+    if validated_mode in ("auto", "dynamic"):
         closed_template, p95_mar = is_closed_mouth_template(landmarks_list)
         if closed_template:
             return {
@@ -494,7 +506,7 @@ def plan_reference_frame_mode(
             placeholder=placeholder,
         )
         return {
-            "effective_mode": "auto",
+            "effective_mode": validated_mode,
             "auto_ref_idx": auto_ref_idx,
             "use_landmark_align": True,
             "closed_template": False,

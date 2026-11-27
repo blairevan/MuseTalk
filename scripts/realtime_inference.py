@@ -299,10 +299,10 @@ class Avatar:
                 f"Template mouth is already closed (p95 MAR={ref_plan['p95_mar']:.3f}); "
                 "keeping per-frame self reference"
             )
-        elif use_landmark_align and effective_ref_mode == "auto":
+        elif use_landmark_align and effective_ref_mode in ("auto", "dynamic"):
             print(
                 f"Auto-selected neutral reference frame: {auto_ref_idx}/{len(frame_list)} "
-                "(source=dwpose-68pt, pose-aligned)"
+                f"(source=dwpose-68pt, pose-aligned, mode={effective_ref_mode})"
             )
         align_counts = {"aligned": 0, "self": 0, "fallback_self": 0}
 
@@ -372,7 +372,7 @@ class Avatar:
                 f"fallback_self={align_counts['fallback_self']}"
             )
         elif effective_ref_mode != "self":
-            if effective_ref_mode == "auto":
+            if effective_ref_mode in ("auto", "dynamic"):
                 auto_ref_idx = select_auto_ref_frame_index(
                     coord_list,
                     landmarks_list=landmarks_list,

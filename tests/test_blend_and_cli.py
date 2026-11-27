@@ -202,6 +202,8 @@ class RunCliPassThroughTest(unittest.TestCase):
         self.assertEqual(self_opts["--ref_frame_mode"], "self")
         auto_256 = self._run(["--ref_frame_mode", "auto"])
         self.assertEqual(auto_256["--ref_frame_mode"], "auto")
+        dynamic_256 = self._run(["--ref_frame_mode", "dynamic"])
+        self.assertEqual(dynamic_256["--ref_frame_mode"], "dynamic")
 
     def test_v10_rejects_512_without_explicit_weights(self):
         """v1.0 with --resolution 512 fails fast unless explicit UNet files are supplied."""

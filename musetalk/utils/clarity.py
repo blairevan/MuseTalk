@@ -13,7 +13,7 @@ import numpy as np
 PASTE_INTERPOLATION_MODES = ("linear", "lanczos")
 ENHANCE_MODES = ("none", "usm")
 SUPPORTED_RESOLUTIONS = (256, 512)
-REF_FRAME_MODES = ("self", "first", "offset", "auto")
+REF_FRAME_MODES = ("self", "first", "offset", "auto", "dynamic")
 
 # Legacy generated face size before pasting back.
 _GENERATED_FACE_SIZE = 256.0
@@ -67,7 +67,7 @@ def resolve_ref_frame_index(frame_index, num_frames, mode="self", auto_ref_index
         return frame_index
     if validated_mode == "first":
         return 0
-    if validated_mode == "auto":
+    if validated_mode in ("auto", "dynamic"):
         if auto_ref_index < 0 or auto_ref_index >= num_frames:
             raise ValueError(
                 f"auto_ref_index {auto_ref_index} out of range for num_frames={num_frames}"

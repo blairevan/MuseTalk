@@ -1,5 +1,6 @@
 import os
 import tempfile
+from collections import OrderedDict
 import cv2
 import torch
 
@@ -54,6 +55,13 @@ from musetalk.utils.clarity import (
 from musetalk.utils.ref_align import (
     align_reference_face_crop,
     plan_reference_frame_mode,
+)
+from musetalk.utils.dynamic_ref import (
+    apply_healed_neck_roi,
+    build_dynamic_reference_plan,
+    build_dynamic_unet_latents,
+    compute_healed_neck_roi,
+    make_resilient_ref_encoder,
 )
 from musetalk.utils.frame_io import FrameSequence
 from musetalk.utils.resource_utils import release_torch_resources
@@ -343,12 +351,14 @@ def main(args):
                 "silence will use the neutral mouth"
             )
             pause_weights = np.zeros(len(whisper_chunks), dtype=np.float32)
-            if args.close_mouth_pauses:
+            voiced_intervals = None
+            if args.close_mouth_pauses or ref_frame_mode == "dynamic":
                 voiced_intervals = get_active_audio_frame_intervals(
                     audio_path,
                     fps,
                     top_db=args.pause_top_db,
                 )
+            if args.close_mouth_pauses:
                 pause_weights = pause_close_weights(
                     voiced_intervals,
                     len(whisper_chunks),
@@ -378,6 +388,8 @@ def main(args):
             # Find the first valid bbox and latents as initial fallback
             first_valid_bbox = None
             first_valid_latents = None
+            first_valid_crop = None
+            first_valid_adj_box = None
             for index, bbox in enumerate(coord_list):
                 if bbox != coord_placeholder and (bbox[2]-bbox[0]) > 0 and (bbox[3]-bbox[1]) > 0:
                     frame = frames[index]
@@ -402,6 +414,8 @@ def main(args):
                         )
                         first_valid_latents = vae.get_latents_for_unet(crop_frame)
                         first_valid_bbox = bbox
+                        first_valid_crop = crop_frame
+                        first_valid_adj_box = (x1, y1, x2, y2)
                         break
                     except:
                         continue
@@ -411,6 +425,8 @@ def main(args):
                 first_valid_bbox = [0, 0, 100, 100]
                 dummy = np.zeros((resolution, resolution, 3), dtype=np.uint8)
                 first_valid_latents = vae.get_latents_for_unet(dummy)
+                first_valid_crop = dummy
+                first_valid_adj_box = (0, 0, 100, 100)
 
             last_valid_bbox = first_valid_bbox
             last_valid_latents = first_valid_latents
@@ -435,6 +451,28 @@ def main(args):
                     "(source=dwpose-68pt, pose-aligned)"
                 )
 
+            frame_index_cycle = build_ping_pong_cycle(list(range(len(frames))))
+            dynamic_plan = None
+            is_dynamic_landmark = (use_landmark_align and effective_ref_mode == "dynamic")
+            if is_dynamic_landmark:
+                dynamic_plan = build_dynamic_reference_plan(
+                    coord_list,
+                    landmarks_list,
+                    frame_index_cycle,
+                    len(whisper_chunks),
+                    voiced_intervals,
+                    fps=fps,
+                    placeholder=coord_placeholder,
+                    frames=frames,
+                )
+                pools = dynamic_plan["pools_info"]
+                print(
+                    f"Dynamic pose+time reference pools: open={len(pools['open_pool'])} frames, "
+                    f"closed={len(pools['closed_pool'])} frames, "
+                    f"silent_routed={int(np.count_nonzero(dynamic_plan['closed_weights'] >= 0.5))}/"
+                    f"{len(whisper_chunks)}"
+                )
+
             fixed_ref_idx = (
                 auto_ref_idx
                 if effective_ref_mode == "auto"
@@ -447,13 +485,29 @@ def main(args):
             )
             align_counts = {"aligned": 0, "self": 0, "fallback_self": 0}
 
-            need_darkness_fallback = (effective_ref_mode == "auto" and not use_landmark_align)
+            need_darkness_fallback = (effective_ref_mode in ("auto", "dynamic") and not use_landmark_align)
             mouth_darkness_scores = [] if need_darkness_fallback else None
+            masked_latents_by_source = [] if is_dynamic_landmark else None
+            self_ref_crops_by_source = [None] * len(coord_list) if is_dynamic_landmark else None
+            adjusted_boxes_by_source = [None] * len(coord_list) if is_dynamic_landmark else None
+            last_valid_masked_latent = (
+                first_valid_latents[:, :first_valid_latents.shape[1] // 2].detach().cpu()
+                if is_dynamic_landmark
+                else first_valid_latents[:, :first_valid_latents.shape[1] // 2]
+            )
+            last_valid_self_crop = first_valid_crop
+            last_valid_adj_box = first_valid_adj_box
+
             for idx, bbox in enumerate(coord_list):
                 if bbox == coord_placeholder or (bbox[2]-bbox[0]) <= 0 or (bbox[3]-bbox[1]) <= 0:
                     # Face detection failed, fallback to previous valid frame data without skipping
                     coord_list[idx] = last_valid_bbox
-                    input_latent_list.append(last_valid_latents)
+                    if is_dynamic_landmark:
+                        masked_latents_by_source.append(last_valid_masked_latent)
+                        self_ref_crops_by_source[idx] = last_valid_self_crop
+                        adjusted_boxes_by_source[idx] = last_valid_adj_box
+                    else:
+                        input_latent_list.append(last_valid_latents)
                     if need_darkness_fallback:
                         mouth_darkness_scores.append(None)
                     continue
@@ -479,6 +533,18 @@ def main(args):
                         (resolution, resolution),
                         interpolation=cv2.INTER_LANCZOS4,
                     )
+                    if is_dynamic_landmark:
+                        masked_img = vae.preprocess_img(crop_frame, half_mask=True)
+                        masked_lat = vae.encode_latents(masked_img).detach().cpu()
+                        masked_latents_by_source.append(masked_lat)
+                        self_ref_crops_by_source[idx] = crop_frame
+                        adjusted_boxes_by_source[idx] = (x1, y1, x2, y2)
+                        last_valid_bbox = bbox
+                        last_valid_masked_latent = masked_lat
+                        last_valid_self_crop = crop_frame
+                        last_valid_adj_box = (x1, y1, x2, y2)
+                        continue
+
                     ref_crop_for_vae = None
                     if use_landmark_align:
                         ref_idx = resolve_ref_frame_index(
@@ -517,40 +583,73 @@ def main(args):
                 except Exception as e:
                     # Fallback on resize/extraction failures
                     coord_list[idx] = last_valid_bbox
-                    input_latent_list.append(last_valid_latents)
+                    if is_dynamic_landmark:
+                        masked_latents_by_source.append(last_valid_masked_latent)
+                        self_ref_crops_by_source[idx] = last_valid_self_crop
+                        adjusted_boxes_by_source[idx] = last_valid_adj_box
+                    else:
+                        input_latent_list.append(last_valid_latents)
                     if need_darkness_fallback:
                         mouth_darkness_scores.append(None)
         
             # Pair each frame's masked latent with a non-self reference when alignment was unavailable
-            if use_landmark_align:
+            if is_dynamic_landmark:
+                max_ref_latent_cache = 256
+                initial_ref_fallback = (
+                    first_valid_latents[:, first_valid_latents.shape[1] // 2:].detach().cpu()
+                )
+
+                def _vae_encode_ref_crop(crop_bgr):
+                    ref_img_tensor = vae.preprocess_img(crop_bgr, half_mask=False)
+                    return vae.encode_latents(ref_img_tensor).detach().cpu()
+
+                _encode_dynamic_ref = make_resilient_ref_encoder(
+                    frames=frames,
+                    landmarks_list=landmarks_list,
+                    adjusted_boxes_by_source=adjusted_boxes_by_source,
+                    self_ref_crops_by_source=self_ref_crops_by_source,
+                    resolution=resolution,
+                    encode_crop_fn=_vae_encode_ref_crop,
+                    initial_fallback_latent=initial_ref_fallback,
+                    align_counts=align_counts,
+                    max_cache_size=max_ref_latent_cache,
+                )
+                input_latent_list_cycle = build_dynamic_unet_latents(
+                    masked_latents_by_source,
+                    dynamic_plan,
+                    _encode_dynamic_ref,
+                )
+                print(
+                    "Reference pose alignment (dynamic): lazy per-batch sequence initialized "
+                    f"(cpu_lru_cap={max_ref_latent_cache})"
+                )
+            elif use_landmark_align:
                 print(
                     f"Reference pose alignment ({effective_ref_mode}): "
                     f"aligned={align_counts['aligned']}, "
                     f"self={align_counts['self']}, "
                     f"fallback_self={align_counts['fallback_self']}"
                 )
-            elif effective_ref_mode != "self":
-                if effective_ref_mode == "auto":
-                    auto_ref_idx = select_auto_ref_frame_index(
-                        coord_list,
-                        landmarks_list=None,
-                        mouth_darkness_scores=mouth_darkness_scores,
-                        placeholder=coord_placeholder,
+                input_latent_list_cycle = [input_latent_list[index] for index in frame_index_cycle]
+            else:
+                if effective_ref_mode != "self":
+                    if effective_ref_mode in ("auto", "dynamic"):
+                        auto_ref_idx = select_auto_ref_frame_index(
+                            coord_list,
+                            landmarks_list=None,
+                            mouth_darkness_scores=mouth_darkness_scores,
+                            placeholder=coord_placeholder,
+                        )
+                        print(
+                            f"Auto-selected neutral reference frame: {auto_ref_idx}/{len(frames)} "
+                            "(source=mouth-roi-fallback)"
+                        )
+                    input_latent_list = rebind_ref_latents(
+                        input_latent_list,
+                        ref_frame_mode=effective_ref_mode,
+                        ref_frame_index=auto_ref_idx,
                     )
-                    print(
-                        f"Auto-selected neutral reference frame: {auto_ref_idx}/{len(frames)} "
-                        "(source=mouth-roi-fallback)"
-                    )
-                input_latent_list = rebind_ref_latents(
-                    input_latent_list,
-                    ref_frame_mode=effective_ref_mode,
-                    ref_frame_index=auto_ref_idx,
-                )
-
-            # Ping-Pong mirror cycle to eliminate seam at loop boundary
-            # Original: [0, 1, ..., N-1] → Extended: [0, 1, ..., N-1, N-2, ..., 1]
-            frame_index_cycle = build_ping_pong_cycle(list(range(len(frames))))
-            input_latent_list_cycle = [input_latent_list[index] for index in frame_index_cycle]
+                input_latent_list_cycle = [input_latent_list[index] for index in frame_index_cycle]
 
             print(f"Frame cycle length: {len(frames)} → {len(frame_index_cycle)} (ping-pong)")
             
@@ -571,14 +670,26 @@ def main(args):
             
             # Execute inference
             for i, (whisper_batch, latent_batch) in enumerate(tqdm(gen, total=total)):
+                whisper_batch = whisper_batch.to(device=device)
                 audio_feature_batch = pe(whisper_batch) if args.use_audio_pe else whisper_batch
-                latent_batch = latent_batch.to(dtype=unet.model.dtype)
+                latent_batch = latent_batch.to(device=device, dtype=unet.model.dtype)
                 
                 pred_latents = unet.model(latent_batch, timesteps, encoder_hidden_states=audio_feature_batch).sample
                 recon = vae.decode_latents(pred_latents)
                 for res_frame in recon:
                     res_frame_list.append(res_frame)
             res_frame_list = res_frame_list[:video_num]
+            if is_dynamic_landmark:
+                print(
+                    f"Reference pose alignment (dynamic): "
+                    f"aligned={align_counts['aligned']}, "
+                    f"self={align_counts['self']}, "
+                    f"fallback_self={align_counts['fallback_self']}"
+                )
+                input_latent_list_cycle = None
+                masked_latents_by_source = None
+                self_ref_crops_by_source = None
+                adjusted_boxes_by_source = None
 
             if args.version == "v15":
                 fp = FaceParsing(
@@ -626,15 +737,26 @@ def main(args):
                 """Return a pose-aligned closed-mouth crop for silence/pause blending."""
                 tx1, ty1, tx2, ty2 = target_box
                 tw, th = tx2 - tx1, ty2 - ty1
+                chosen_ref_idx = (
+                    dynamic_plan["nearest_closed_by_source"][target_source_idx]
+                    if dynamic_plan is not None
+                    else neutral_ref_idx
+                )
+                chosen_ref_frame = (
+                    frames[chosen_ref_idx]
+                    if chosen_ref_idx != neutral_ref_idx
+                    else neutral_full_frame
+                )
                 if (
-                    neutral_full_frame is not None
+                    chosen_ref_frame is not None
                     and landmarks_list is not None
                     and len(landmarks_list) == len(coord_list)
-                    and target_source_idx != neutral_ref_idx
                 ):
+                    if target_source_idx == chosen_ref_idx:
+                        return chosen_ref_frame[ty1:ty2, tx1:tx2].copy()
                     aligned_closed, status = align_reference_face_crop(
-                        neutral_full_frame,
-                        landmarks_list[neutral_ref_idx],
+                        chosen_ref_frame,
+                        landmarks_list[chosen_ref_idx],
                         landmarks_list[target_source_idx],
                         (tx1, ty1, tx2, ty2),
                         (tw, th),
@@ -646,6 +768,11 @@ def main(args):
                     (tw, th),
                     interpolation=cv2.INTER_LANCZOS4,
                 )
+
+            healed_neck_roi_cache = OrderedDict()
+            max_neck_roi_cache = 256
+            healed_neck_count = 0
+            evaluated_neck_sources = set()
 
             for i, res_frame in enumerate(tqdm(res_frame_list)):
                 source_index = frame_index_cycle[i % len(frame_index_cycle)]
@@ -669,6 +796,33 @@ def main(args):
                     )
                     y2 = y2 + args.extra_margin
                     y2 = min(y2, ori_frame.shape[0])
+
+                if dynamic_plan is not None:
+                    if source_index in healed_neck_roi_cache:
+                        healed_neck_roi_cache.move_to_end(source_index)
+                    else:
+                        j_closed = dynamic_plan["nearest_closed_by_source"][source_index]
+                        roi_patch = None
+                        if j_closed != source_index:
+                            try:
+                                roi_patch = compute_healed_neck_roi(
+                                    ori_frame,
+                                    landmarks_list[source_index],
+                                    (x1, y1, x2, y2),
+                                    frames[j_closed],
+                                    landmarks_list[j_closed],
+                                    fp=fp,
+                                )
+                            except Exception as heal_err:
+                                print(f"Warning: neck pre-heal skipped for source {source_index}: {heal_err}")
+                        healed_neck_roi_cache[source_index] = roi_patch
+                        if len(healed_neck_roi_cache) > max_neck_roi_cache:
+                            healed_neck_roi_cache.popitem(last=False)
+                        if source_index not in evaluated_neck_sources:
+                            evaluated_neck_sources.add(source_index)
+                            if roi_patch is not None:
+                                healed_neck_count += 1
+                    ori_frame = apply_healed_neck_roi(ori_frame, healed_neck_roi_cache[source_index])
 
                 pause_weight = float(pause_weights[i]) if i < len(pause_weights) else 0.0
                 has_neutral_face = neutral_face is not None and neutral_face.size > 0
@@ -745,6 +899,13 @@ def main(args):
                     cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", combine_frame)
                 except Exception as e:
                     cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", ori_frame)
+
+            if dynamic_plan is not None:
+                print(
+                    f"Open-jaw neck pre-healing: healed {healed_neck_count}/"
+                    f"{len(evaluated_neck_sources)} unique source frames"
+                )
+                healed_neck_roi_cache = None
 
             # Save prediction results
             temp_vid_path = os.path.join(task_directory.name, "rendered.mp4")
@@ -857,6 +1018,6 @@ if __name__ == "__main__":
     parser.add_argument("--use_audio_pe", type=parse_bool, default=True,
                         help="Add positional encoding to Whisper features (legacy true; for A/B against training)")
     parser.add_argument("--ref_frame_mode", type=str, default="self", choices=list(REF_FRAME_MODES),
-                        help="UNet reference latent source: 'self' (legacy), 'first' (frame 0), 'offset' (half-cycle), or 'auto' (best closed-mouth frontal frame)")
+                        help="UNet reference latent source: 'self' (legacy), 'first' (frame 0), 'offset' (half-cycle), 'auto' (best closed-mouth frontal frame), or 'dynamic' (pose+time nearest open/closed pools + neck pre-heal)")
     args = parser.parse_args()
     main(args)

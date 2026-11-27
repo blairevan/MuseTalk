@@ -681,7 +681,7 @@ def main():
     parser.add_argument("--use_audio_pe", type=parse_bool, default=None,
                         help="Add positional encoding to Whisper features (default: true for 256, false for 512)")
     parser.add_argument("--ref_frame_mode", type=str, default=None, choices=list(REF_FRAME_MODES),
-                        help="UNet reference latent source: 'self', 'first', 'offset', or 'auto' (default: self for 256, auto for 512)")
+                        help="UNet reference latent source: 'self', 'first', 'offset', 'auto', or 'dynamic' (default: self for 256, auto for 512)")
     parser.add_argument("--max_input_long_edge", type=int, default=DEFAULT_MAX_INPUT_LONG_EDGE,
                         help="Downscale input videos exceeding this long-edge size before inference; 0 disables (default: 1920)")
     

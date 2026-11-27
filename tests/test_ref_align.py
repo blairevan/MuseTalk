@@ -235,6 +235,11 @@ class ComposedWarpAndPlanTest(unittest.TestCase):
         self.assertEqual(plan_no_lm["effective_mode"], "auto")
         self.assertFalse(plan_no_lm["use_landmark_align"])
 
+        # Same-length list of unusable None landmarks must also degrade to non-landmark fallback
+        plan_all_none_lm = ref_align.plan_reference_frame_mode("dynamic", coords, [None] * 4)
+        self.assertEqual(plan_all_none_lm["effective_mode"], "dynamic")
+        self.assertFalse(plan_all_none_lm["use_landmark_align"])
+
         plan_first = ref_align.plan_reference_frame_mode("first", coords, speaking_lms)
         self.assertEqual(plan_first["effective_mode"], "first")
         self.assertEqual(plan_first["auto_ref_idx"], 0)

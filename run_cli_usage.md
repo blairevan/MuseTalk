@@ -97,7 +97,7 @@ The first four options below are **on by default** since 2026-11-20, after 4K A/
 | `--pause_fade_frames` | `int` | `4` | Frames used for each fade in and out. (渐入、渐出各用的帧数) |
 | `--pause_top_db` | `float` | `38.0` | Silence threshold below the audio peak, in dB; raise it for audio with background noise or music. (停顿检测门限，相对峰值的分贝数；有底噪或背景音乐时调大) |
 | `--use_audio_pe` | `bool` | `auto` | Add positional encoding to Whisper features (`true` for 256, `false` for 512 unless explicitly set). (音频位置编码；256 默认 `true`，512 默认 `false`) |
-| `--ref_frame_mode` | `str` | `auto` | UNet reference latent source: `self`, `first`, `offset`, or `auto` (DWPose 68-pt closed-mouth frontal selection). Defaults to `auto` for 512 and `self` for 256. (参考帧策略；512 默认 `auto` 自动检测正脸闭嘴帧，256 默认 `self`) |
+| `--ref_frame_mode` | `str` | `auto` | UNet reference latent source: `self`, `first`, `offset`, `auto` (DWPose 68-pt closed-mouth frontal selection), or `dynamic` (pose+time nearest open/closed pools + open-jaw neck pre-healing). Defaults to `auto` for 512 and `self` for 256. (参考帧策略；新增 `dynamic` 支持姿态+时间最近邻张嘴/闭嘴参考帧切换与下巴颈部预修复；512 默认 `auto`，256 默认 `self`) |
 
 Reproduce the previous (pre-2026-11-20) output (复现旧版输出):
 
@@ -130,3 +130,4 @@ The final audio mux now copies the rendered video stream instead of re-encoding 
 | 2026-11-20 17:33:00 +08:00 | 新增 `--pause_top_db` 参数说明（此前底层脚本支持但包装入口未透传）。实测输出视频码率约由 2.5 Mbps 升至 4.6 Mbps（4K、58 s 样例文件 18.6 MB → 34.4 MB），系去掉二次编码所致。 |
 | 2026-11-20 17:52:00 +08:00 | “内部运行机制”更新：每次运行使用唯一的临时任务文件 `temp_cli_task_*.yaml`；底层推理默认不再在输出目录的上级写人脸坐标文件（仅 `--saved_coord` 时写入）。 |
 | 2026-11-24 00:29:00 +08:00 | 补充 `--resolution`、`--unet_model_path`、`--unet_config`、`--batch_size`、`--use_float16`/`--no_float16` 与 `--ref_frame_mode` 说明：`v1.5` 检测到本地 `./models/musetalkV15_512/{unet.pth,musetalk.json}` 时默认自动启用 `512` 并联动安全默认值（`batch_size=2`、`use_float16=true`、`use_audio_pe=false`、`ref_frame_mode=auto`），无 512 权重或显式 `--resolution 256` 时保持旧版 `256` 行为。 |
+| 2026-11-27 18:20:00 +08:00 | 为 `--ref_frame_mode` 新增 `dynamic` 候选模式说明：利用 DWPose 68 点关键点构建张嘴（保留牙齿特征）与自然闭嘴双参考池，按姿态+时间最近邻与音频长停顿平滑路由，并对原底板张嘴帧做下巴/上颈部预修复以消除双下巴与喉结伪影。 |
