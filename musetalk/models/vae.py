@@ -124,17 +124,20 @@ class VAE():
         image = image[...,::-1] # RGB to BGR
         return image
     
-    def get_latents_for_unet(self,img):
+    def get_latents_for_unet(self, img, ref_img=None):
         """
         Prepare latent variables for a U-Net model.
-        :param img: The image to process.
+        :param img: The image to process for the masked upper-face branch.
+        :param ref_img: Optional reference image for the unmasked reference branch;
+            defaults to ``img`` when omitted.
         :return: A concatenated tensor of latents for U-Net input.
         """
         
-        ref_image = self.preprocess_img(img,half_mask=True) # [1, 3, 256, 256] RGB, torch tensor
-        masked_latents = self.encode_latents(ref_image) # [1, 4, 32, 32], torch tensor
-        ref_image = self.preprocess_img(img,half_mask=False) # [1, 3, 256, 256] RGB, torch tensor
-        ref_latents = self.encode_latents(ref_image) # [1, 4, 32, 32], torch tensor
+        masked_image = self.preprocess_img(img, half_mask=True) # [1, 3, H, W] RGB, torch tensor
+        masked_latents = self.encode_latents(masked_image) # [1, 4, H/8, W/8], torch tensor
+        ref_source = img if ref_img is None else ref_img
+        ref_image = self.preprocess_img(ref_source, half_mask=False) # [1, 3, H, W] RGB, torch tensor
+        ref_latents = self.encode_latents(ref_image) # [1, 4, H/8, W/8], torch tensor
         latent_model_input = torch.cat([masked_latents, ref_latents], dim=1)
         return latent_model_input
 

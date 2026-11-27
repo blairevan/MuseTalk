@@ -11,6 +11,7 @@ from mmpose.apis import inference_topdown, init_model
 from mmpose.structures import merge_data_samples
 import torch
 from tqdm import tqdm
+from .ref_align import build_upper_body_pose_box
 
 config_file = './musetalk/utils/dwpose/rtmpose-l_8xb32-270e_coco-ubody-wholebody-384x288.py'
 checkpoint_file = './models/dwpose/dw-ll_ucoco_384.pth'
@@ -149,23 +150,26 @@ def get_frame_bboxes(frames, upperbondrange=0, return_landmarks=False):
     average_range_minus = []
     average_range_plus = []
     for frame_number, frame in enumerate(tqdm(frames), start=1):
-        results = inference_topdown(pose_model, frame.copy())
-        results = merge_data_samples(results)
-        keypoints = results.pred_instances.keypoints
-        face_land_mark= keypoints[0][23:91]
-        face_land_mark = face_land_mark.astype(np.int32)
-        
-        # get bounding boxes by face detetion
+        # Detect face box first so faceless frames skip DWPose and full-body 4K
+        # frames crop an upper-body ROI for 2-3x sharper facial keypoints.
         bbox = face_alignment.get_detections_for_batch(frame[None, ...])
         
-        # adjust the bounding box refer to landmark
-        # Add the bounding box to a tuple and append it to the coordinates list
         for j, f in enumerate(bbox):
             if f is None: # no face in the image
                 coords_list += [coord_placeholder]
                 if return_landmarks:
                     landmarks_list.append(None)
                 continue
+
+            ubox = build_upper_body_pose_box(f, frame.shape)
+            if ubox is not None:
+                results = inference_topdown(pose_model, frame.copy(), bboxes=ubox)
+            else:
+                results = inference_topdown(pose_model, frame.copy())
+            results = merge_data_samples(results)
+            keypoints = results.pred_instances.keypoints
+            face_land_mark_f32 = keypoints[0][23:91].astype(np.float32)
+            face_land_mark = face_land_mark_f32.astype(np.int32)
             
             half_face_coord =  face_land_mark[29].copy()#np.mean([face_land_mark[28], face_land_mark[29]], axis=0)
             range_minus = (face_land_mark[30]- face_land_mark[29])[1]
@@ -190,7 +194,7 @@ def get_frame_bboxes(frames, upperbondrange=0, return_landmarks=False):
             else:
                 coords_list += [f_landmark]
                 if return_landmarks:
-                    landmarks_list.append(face_land_mark.copy())
+                    landmarks_list.append(face_land_mark_f32.copy())
         clear_cuda_cache_periodically(frame_number)
     
     print("********************************************bbox_shift parameter adjustment**********************************************************")

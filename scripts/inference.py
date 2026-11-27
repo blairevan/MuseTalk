@@ -44,10 +44,16 @@ from musetalk.utils.clarity import (
     estimate_mouth_cavity_darkness,
     rebind_ref_latents,
     resize_generated_face,
+    resolve_ref_frame_index,
+    score_landmark_neutral_ref,
     select_auto_ref_frame_index,
     sharpen_lip_region,
     validate_ref_frame_mode,
     validate_resolution,
+)
+from musetalk.utils.ref_align import (
+    align_reference_face_crop,
+    plan_reference_frame_mode,
 )
 from musetalk.utils.frame_io import FrameSequence
 from musetalk.utils.resource_utils import release_torch_resources
@@ -262,7 +268,13 @@ def main(args):
                         print("Ignoring saved coordinates with a different frame count")
                 if coord_list is None:
                     print("Extracting landmarks... time-consuming operation")
-                    if ref_frame_mode == "auto":
+                    need_landmarks = (
+                        ref_frame_mode != "self"
+                        or args.close_mouth_start
+                        or args.close_mouth_end
+                        or args.close_mouth_pauses
+                    )
+                    if need_landmarks:
                         coord_list, landmarks_list = get_frame_bboxes(
                             frames,
                             bbox_shift,
@@ -403,7 +415,39 @@ def main(args):
             last_valid_bbox = first_valid_bbox
             last_valid_latents = first_valid_latents
 
-            need_darkness_fallback = (ref_frame_mode == "auto" and landmarks_list is None)
+            ref_plan = plan_reference_frame_mode(
+                ref_frame_mode,
+                coord_list,
+                landmarks_list=landmarks_list,
+                placeholder=coord_placeholder,
+            )
+            effective_ref_mode = ref_plan["effective_mode"]
+            auto_ref_idx = ref_plan["auto_ref_idx"]
+            use_landmark_align = ref_plan["use_landmark_align"]
+            if ref_plan["closed_template"]:
+                print(
+                    f"Template mouth is already closed (p95 MAR={ref_plan['p95_mar']:.3f}); "
+                    "keeping per-frame self reference"
+                )
+            elif use_landmark_align and effective_ref_mode == "auto":
+                print(
+                    f"Auto-selected neutral reference frame: {auto_ref_idx}/{len(frames)} "
+                    "(source=dwpose-68pt, pose-aligned)"
+                )
+
+            fixed_ref_idx = (
+                auto_ref_idx
+                if effective_ref_mode == "auto"
+                else (0 if effective_ref_mode == "first" else None)
+            )
+            cached_ref_frame = (
+                frames[fixed_ref_idx]
+                if (use_landmark_align and fixed_ref_idx is not None)
+                else None
+            )
+            align_counts = {"aligned": 0, "self": 0, "fallback_self": 0}
+
+            need_darkness_fallback = (effective_ref_mode == "auto" and not use_landmark_align)
             mouth_darkness_scores = [] if need_darkness_fallback else None
             for idx, bbox in enumerate(coord_list):
                 if bbox == coord_placeholder or (bbox[2]-bbox[0]) <= 0 or (bbox[3]-bbox[1]) <= 0:
@@ -435,7 +479,36 @@ def main(args):
                         (resolution, resolution),
                         interpolation=cv2.INTER_LANCZOS4,
                     )
-                    latents = vae.get_latents_for_unet(crop_frame)
+                    ref_crop_for_vae = None
+                    if use_landmark_align:
+                        ref_idx = resolve_ref_frame_index(
+                            idx,
+                            len(frames),
+                            mode=effective_ref_mode,
+                            auto_ref_index=auto_ref_idx or 0,
+                        )
+                        if ref_idx == idx:
+                            align_counts["self"] += 1
+                        else:
+                            ref_src_frame = (
+                                cached_ref_frame
+                                if (cached_ref_frame is not None and ref_idx == fixed_ref_idx)
+                                else frames[ref_idx]
+                            )
+                            aligned_crop, align_status = align_reference_face_crop(
+                                ref_src_frame,
+                                landmarks_list[ref_idx],
+                                landmarks_list[idx],
+                                (x1, y1, x2, y2),
+                                resolution,
+                            )
+                            if align_status == "aligned" and aligned_crop is not None:
+                                ref_crop_for_vae = aligned_crop
+                                align_counts["aligned"] += 1
+                            else:
+                                align_counts["fallback_self"] += 1
+
+                    latents = vae.get_latents_for_unet(crop_frame, ref_img=ref_crop_for_vae)
                     last_valid_bbox = bbox
                     last_valid_latents = latents
                     input_latent_list.append(latents)
@@ -448,25 +521,31 @@ def main(args):
                     if need_darkness_fallback:
                         mouth_darkness_scores.append(None)
         
-            # Optionally pair each frame's masked latent with a non-self reference frame
-            auto_ref_idx = None
-            if ref_frame_mode == "auto":
-                auto_ref_idx = select_auto_ref_frame_index(
-                    coord_list,
-                    landmarks_list=landmarks_list,
-                    mouth_darkness_scores=mouth_darkness_scores,
-                    placeholder=coord_placeholder,
-                )
-                ref_source = "dwpose-68pt" if landmarks_list is not None else "mouth-roi-fallback"
+            # Pair each frame's masked latent with a non-self reference when alignment was unavailable
+            if use_landmark_align:
                 print(
-                    f"Auto-selected neutral reference frame: {auto_ref_idx}/{len(frames)} "
-                    f"(source={ref_source})"
+                    f"Reference pose alignment ({effective_ref_mode}): "
+                    f"aligned={align_counts['aligned']}, "
+                    f"self={align_counts['self']}, "
+                    f"fallback_self={align_counts['fallback_self']}"
                 )
-            input_latent_list = rebind_ref_latents(
-                input_latent_list,
-                ref_frame_mode=ref_frame_mode,
-                ref_frame_index=auto_ref_idx,
-            )
+            elif effective_ref_mode != "self":
+                if effective_ref_mode == "auto":
+                    auto_ref_idx = select_auto_ref_frame_index(
+                        coord_list,
+                        landmarks_list=None,
+                        mouth_darkness_scores=mouth_darkness_scores,
+                        placeholder=coord_placeholder,
+                    )
+                    print(
+                        f"Auto-selected neutral reference frame: {auto_ref_idx}/{len(frames)} "
+                        "(source=mouth-roi-fallback)"
+                    )
+                input_latent_list = rebind_ref_latents(
+                    input_latent_list,
+                    ref_frame_mode=effective_ref_mode,
+                    ref_frame_index=auto_ref_idx,
+                )
 
             # Ping-Pong mirror cycle to eliminate seam at loop boundary
             # Original: [0, 1, ..., N-1] → Extended: [0, 1, ..., N-1, N-2, ..., 1]
@@ -511,27 +590,62 @@ def main(args):
 
             # Pad generated images to original video size
             print("Padding generated images to original video size")
-            neutral_bbox = coord_list[0]
+            neutral_ref_idx = 0
+            if landmarks_list is not None and len(landmarks_list) == len(coord_list) and len(frames) > 1:
+                frame0_scored = score_landmark_neutral_ref(landmarks_list[0])
+                if frame0_scored is None or frame0_scored[0] > 0.10:
+                    neutral_ref_idx = select_auto_ref_frame_index(
+                        coord_list,
+                        landmarks_list=landmarks_list,
+                        placeholder=coord_placeholder,
+                    )
+
+            neutral_bbox = coord_list[neutral_ref_idx]
             neutral_face = None
+            neutral_full_frame = None
             if (
                 neutral_bbox != coord_placeholder
                 and (neutral_bbox[2] - neutral_bbox[0]) > 0
                 and (neutral_bbox[3] - neutral_bbox[1]) > 0
             ):
-                neutral_frame = frames[0]
+                neutral_full_frame = frames[neutral_ref_idx]
                 neutral_x1, neutral_y1, neutral_x2, neutral_y2 = neutral_bbox
                 if args.version == "v15":
                     neutral_x1, neutral_y1, neutral_x2, neutral_y2 = adjust_face_box(
                         neutral_bbox,
-                        neutral_frame.shape,
+                        neutral_full_frame.shape,
                         bbox_left_ratio=args.bbox_left_ratio,
                         bbox_right_ratio=args.bbox_right_ratio,
                         bbox_top_ratio=args.bbox_top_ratio,
                         bbox_bottom_ratio=args.bbox_bottom_ratio
                     )
-                    neutral_y2 = min(neutral_y2 + args.extra_margin, neutral_frame.shape[0])
-                neutral_face = neutral_frame[neutral_y1:neutral_y2, neutral_x1:neutral_x2].copy()
-                del neutral_frame
+                    neutral_y2 = min(neutral_y2 + args.extra_margin, neutral_full_frame.shape[0])
+                neutral_face = neutral_full_frame[neutral_y1:neutral_y2, neutral_x1:neutral_x2].copy()
+
+            def _build_closed_face_for_frame(target_source_idx, target_box):
+                """Return a pose-aligned closed-mouth crop for silence/pause blending."""
+                tx1, ty1, tx2, ty2 = target_box
+                tw, th = tx2 - tx1, ty2 - ty1
+                if (
+                    neutral_full_frame is not None
+                    and landmarks_list is not None
+                    and len(landmarks_list) == len(coord_list)
+                    and target_source_idx != neutral_ref_idx
+                ):
+                    aligned_closed, status = align_reference_face_crop(
+                        neutral_full_frame,
+                        landmarks_list[neutral_ref_idx],
+                        landmarks_list[target_source_idx],
+                        (tx1, ty1, tx2, ty2),
+                        (tw, th),
+                    )
+                    if status == "aligned" and aligned_closed is not None:
+                        return aligned_closed
+                return cv2.resize(
+                    neutral_face,
+                    (tw, th),
+                    interpolation=cv2.INTER_LANCZOS4,
+                )
 
             for i, res_frame in enumerate(tqdm(res_frame_list)):
                 source_index = frame_index_cycle[i % len(frame_index_cycle)]
@@ -567,11 +681,7 @@ def main(args):
                     try:
                         if not has_neutral_face:
                             raise ValueError("Neutral reference face is unavailable")
-                        closed_face = cv2.resize(
-                            neutral_face,
-                            (x2 - x1, y2 - y1),
-                            interpolation=cv2.INTER_LANCZOS4
-                        )
+                        closed_face = _build_closed_face_for_frame(source_index, (x1, y1, x2, y2))
                         if args.version == "v15":
                             combine_frame = get_image(
                                 ori_frame,
@@ -609,11 +719,7 @@ def main(args):
 
                 # Fade toward the neutral mouth at the edges of mid-sentence pauses
                 if pause_weight > 0.0 and has_neutral_face:
-                    closed_face = cv2.resize(
-                        neutral_face,
-                        (x2 - x1, y2 - y1),
-                        interpolation=cv2.INTER_LANCZOS4
-                    )
+                    closed_face = _build_closed_face_for_frame(source_index, (x1, y1, x2, y2))
                     res_frame = blend_faces(res_frame, closed_face, pause_weight)
                 
                 # Merge results with version-specific parameters

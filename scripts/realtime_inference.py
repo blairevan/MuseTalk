@@ -36,10 +36,15 @@ from musetalk.utils.clarity import (
     SUPPORTED_RESOLUTIONS,
     rebind_ref_latents,
     resize_generated_face,
+    resolve_ref_frame_index,
     select_auto_ref_frame_index,
     validate_cached_avatar_resolution,
     validate_ref_frame_mode,
     validate_resolution,
+)
+from musetalk.utils.ref_align import (
+    align_reference_face_crop,
+    plan_reference_frame_mode,
 )
 from musetalk.utils.sequence_utils import build_ping_pong_cycle
 
@@ -108,6 +113,7 @@ class Avatar:
             "protect_upper_face": args.protect_upper_face,
             "vae_latent_mode": args.vae_latent_mode,
             "ref_frame_mode": args.ref_frame_mode,
+            "material_schema_version": 2,
         }
         self.preparation = preparation
         self.batch_size = batch_size
@@ -134,6 +140,7 @@ class Avatar:
             ("protect_upper_face", False),
             ("vae_latent_mode", "sample"),
             ("ref_frame_mode", "self"),
+            ("material_schema_version", 1),
         ):
             if cached_info.get(cache_key, legacy_value) != self.avatar_info[cache_key]:
                 print(
@@ -229,7 +236,7 @@ class Avatar:
 
         print("extracting landmarks...")
         landmarks_list = None
-        if args.ref_frame_mode == "auto":
+        if args.ref_frame_mode != "self":
             coord_list, frame_list, landmarks_list = get_landmark_and_bbox(
                 input_img_list,
                 self.bbox_shift,
@@ -278,6 +285,27 @@ class Avatar:
         last_valid_bbox = first_valid_bbox
         last_valid_latents = first_valid_latents
 
+        ref_plan = plan_reference_frame_mode(
+            args.ref_frame_mode,
+            coord_list,
+            landmarks_list=landmarks_list,
+            placeholder=coord_placeholder,
+        )
+        effective_ref_mode = ref_plan["effective_mode"]
+        auto_ref_idx = ref_plan["auto_ref_idx"]
+        use_landmark_align = ref_plan["use_landmark_align"]
+        if ref_plan["closed_template"]:
+            print(
+                f"Template mouth is already closed (p95 MAR={ref_plan['p95_mar']:.3f}); "
+                "keeping per-frame self reference"
+            )
+        elif use_landmark_align and effective_ref_mode == "auto":
+            print(
+                f"Auto-selected neutral reference frame: {auto_ref_idx}/{len(frame_list)} "
+                "(source=dwpose-68pt, pose-aligned)"
+            )
+        align_counts = {"aligned": 0, "self": 0, "fallback_self": 0}
+
         for idx, (bbox, frame) in enumerate(zip(coord_list, frame_list)):
             if bbox == coord_placeholder or (bbox[2]-bbox[0]) <= 0 or (bbox[3]-bbox[1]) <= 0:
                 coord_list[idx] = last_valid_bbox
@@ -305,7 +333,30 @@ class Avatar:
                     (args.resolution, args.resolution),
                     interpolation=cv2.INTER_LANCZOS4,
                 )
-                latents = vae.get_latents_for_unet(resized_crop_frame)
+                ref_crop_for_vae = None
+                if use_landmark_align:
+                    ref_idx = resolve_ref_frame_index(
+                        idx,
+                        len(frame_list),
+                        mode=effective_ref_mode,
+                        auto_ref_index=auto_ref_idx or 0,
+                    )
+                    if ref_idx == idx:
+                        align_counts["self"] += 1
+                    else:
+                        aligned_crop, align_status = align_reference_face_crop(
+                            frame_list[ref_idx],
+                            landmarks_list[ref_idx],
+                            landmarks_list[idx],
+                            (x1, y1, x2, y2),
+                            args.resolution,
+                        )
+                        if align_status == "aligned" and aligned_crop is not None:
+                            ref_crop_for_vae = aligned_crop
+                            align_counts["aligned"] += 1
+                        else:
+                            align_counts["fallback_self"] += 1
+                latents = vae.get_latents_for_unet(resized_crop_frame, ref_img=ref_crop_for_vae)
                 last_valid_bbox = coord_list[idx]
                 last_valid_latents = latents
                 input_latent_list.append(latents)
@@ -313,19 +364,26 @@ class Avatar:
                 coord_list[idx] = last_valid_bbox
                 input_latent_list.append(last_valid_latents)
 
-        auto_ref_idx = None
-        if args.ref_frame_mode == "auto":
-            auto_ref_idx = select_auto_ref_frame_index(
-                coord_list,
-                landmarks_list=landmarks_list,
-                placeholder=coord_placeholder,
+        if use_landmark_align:
+            print(
+                f"Reference pose alignment ({effective_ref_mode}): "
+                f"aligned={align_counts['aligned']}, "
+                f"self={align_counts['self']}, "
+                f"fallback_self={align_counts['fallback_self']}"
             )
-            print(f"Auto-selected neutral reference frame: {auto_ref_idx}/{len(frame_list)}")
-        input_latent_list = rebind_ref_latents(
-            input_latent_list,
-            ref_frame_mode=args.ref_frame_mode,
-            ref_frame_index=auto_ref_idx,
-        )
+        elif effective_ref_mode != "self":
+            if effective_ref_mode == "auto":
+                auto_ref_idx = select_auto_ref_frame_index(
+                    coord_list,
+                    landmarks_list=landmarks_list,
+                    placeholder=coord_placeholder,
+                )
+                print(f"Auto-selected neutral reference frame: {auto_ref_idx}/{len(frame_list)}")
+            input_latent_list = rebind_ref_latents(
+                input_latent_list,
+                ref_frame_mode=effective_ref_mode,
+                ref_frame_index=auto_ref_idx,
+            )
 
         # Ping-Pong mirror cycle to eliminate seam at loop boundary
         # Original: [0, 1, ..., N-1] → Extended: [0, 1, ..., N-1, N-2, ..., 1]

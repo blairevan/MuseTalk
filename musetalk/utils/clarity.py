@@ -141,6 +141,12 @@ def estimate_mouth_cavity_darkness(face_bgr):
     return float(np.mean(luma < 0.55 * skin_ref))
 
 
+# Natural closed-mouth MAR plateau: any inner-lip ratio below this threshold is
+# treated as equally closed so auto-selection picks the most frontal, median-box
+# natural frame instead of a tightly pursed outlier frame.
+_CLOSED_MOUTH_MAR_FLOOR = 0.035
+
+
 def select_auto_ref_frame_index(
     coord_list,
     landmarks_list=None,
@@ -153,7 +159,7 @@ def select_auto_ref_frame_index(
         coord_list (list): Per-frame face bounding boxes ``[x1, y1, x2, y2]``.
         landmarks_list (list | None): Optional per-frame ``(68, 2)`` landmarks
             from DWPose. When valid entries exist, selection uses
-            ``3.0 * mar + 1.0 * yaw_asym + 0.5 * pose_dev``.
+            ``3.0 * max(mar, 0.035) + 1.0 * yaw_asym + 1.0 * pose_dev``.
         mouth_darkness_scores (list | None): Optional per-frame dark-cavity ratios
             from :func:`estimate_mouth_cavity_darkness` used when landmarks are
             unavailable (e.g. ``--use_saved_coord``).
@@ -201,7 +207,8 @@ def select_auto_ref_frame_index(
             scored = score_landmark_neutral_ref(landmarks_list[idx])
             if scored is not None:
                 mar, yaw_asym = scored
-                total = 3.0 * mar + 1.0 * yaw_asym + 0.5 * pose_dev[idx]
+                effective_mar = max(float(mar), _CLOSED_MOUTH_MAR_FLOOR)
+                total = 3.0 * effective_mar + 1.0 * yaw_asym + 1.0 * pose_dev[idx]
                 landmark_candidates.append((total, idx))
         if landmark_candidates:
             landmark_candidates.sort(key=lambda item: (item[0], item[1]))

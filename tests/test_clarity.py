@@ -223,6 +223,22 @@ class RefFrameModeTest(unittest.TestCase):
         # Empty/missing coords returns 0 safely
         self.assertEqual(clarity.select_auto_ref_frame_index([(0.0, 0.0, 0.0, 0.0)]), 0)
 
+    def test_select_auto_ref_prefers_median_box_over_pursed_outlier(self):
+        """Among closed frames below MAR floor, median-scale natural frame beats pursed outlier."""
+        coords = [
+            [100, 100, 230, 270],  # 0: relaxed closed mouth, median height=170 -> winner
+            [100, 100, 230, 270],  # 1: open speaking mouth
+            [100, 100, 230, 270],  # 2: open speaking mouth
+            [100, 82, 230, 272],   # 3: tightly pursed (mar=0.0) but outlier height=190
+        ]
+        landmarks = [
+            self._make_landmarks(mouth_gap=2.0, yaw_shift=0.0),   # mar=0.025 (naturally closed)
+            self._make_landmarks(mouth_gap=18.0, yaw_shift=0.0),
+            self._make_landmarks(mouth_gap=20.0, yaw_shift=0.0),
+            self._make_landmarks(mouth_gap=0.0, yaw_shift=0.0),   # mar=0.000 (pursed outlier)
+        ]
+        self.assertEqual(clarity.select_auto_ref_frame_index(coords, landmarks_list=landmarks), 0)
+
     def test_rebind_ref_latents_auto_mode(self):
         """auto mode binds every frame's ref channels to the chosen ref_frame_index."""
         latents = [

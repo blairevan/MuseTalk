@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 from PIL import Image
 from .model import BiSeNet
+from musetalk.utils.mask_utils import guard_jaw_dilation_mask
 import torchvision.transforms as transforms
 
 class FaceParsing():
@@ -100,9 +101,10 @@ class FaceParsing():
                 eroded = cv2.erode(original_dilated, self.cheek_kernel, iterations=2)
                 face_region = cv2.bitwise_and(eroded, self.cheek_mask)
                 face_region = cv2.bitwise_or(face_region, cv2.bitwise_and(original_dilated, ~self.cheek_mask))
-                parsing[(face_region==255) & (~np.isin(parsing, [10]))] = 255         
-                parsing[np.isin(parsing, [11, 12, 13])] = 255
-                parsing[np.where(parsing!=255)] = 0
+                jaw_mask = np.zeros_like(parsing, dtype=np.uint8)
+                jaw_mask[(face_region == 255) & (~np.isin(parsing, [10]))] = 255
+                jaw_mask[np.isin(parsing, [11, 12, 13])] = 255
+                parsing = guard_jaw_dilation_mask(parsing, jaw_mask)
             elif mode == "mouth":
                 # Mouth interior only (class 11), used to locate generated teeth
                 parsing[np.isin(parsing, [11])] = 255
