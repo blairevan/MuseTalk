@@ -75,6 +75,35 @@ class FaceParsing():
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ])
 
+    def parse_classes(self, image, size=(512, 512)):
+        """Return raw 19-class BiSeNet segmentation resized to ``image.size``.
+
+        Args:
+            image (PIL.Image.Image | str): Input RGB image or file path.
+            size (tuple[int, int]): Internal BiSeNet evaluation resolution.
+
+        Returns:
+            PIL.Image.Image: Single-channel ``uint8`` class map matching ``image.size``.
+        """
+        if isinstance(image, str):
+            with Image.open(image) as opened:
+                image = opened.convert("RGB")
+        elif image.mode != "RGB":
+            image = image.convert("RGB")
+
+        orig_size = image.size
+        with torch.no_grad():
+            resized = image.resize(size, Image.BILINEAR)
+            img = torch.unsqueeze(self.preprocess(resized), 0)
+            net_params = tuple(self.net.parameters()) if hasattr(self.net, "parameters") else ()
+            if net_params:
+                img = img.to(device=net_params[0].device)
+            elif torch.cuda.is_available():
+                img = img.cuda()
+            out = self.net(img)[0]
+            parsing = out.squeeze(0).cpu().numpy().argmax(0).astype(np.uint8)
+        return Image.fromarray(parsing).resize(orig_size, Image.NEAREST)
+
     def __call__(self, image, size=(512, 512), mode="raw"):
         if isinstance(image, str):
             image = Image.open(image)

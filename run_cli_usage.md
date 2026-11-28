@@ -72,10 +72,10 @@ These parameters affect how the generated mouth area is blended back into the or
 
 | Argument (参数名) | Type (类型) | Default (默认值) | Choices (候选值) | Description (说明) |
 | :--- | :--- | :--- | :--- | :--- |
-| `--parsing_mode` | `str` | `"jaw"` | `["jaw", "raw"]` | Face blending parsing mode. (面部融合解析模式) |
-| `--left_cheek_width` | `int` | `120` | | Width of left cheek editing region. (左脸颊编辑区域的宽度) |
-| `--right_cheek_width` | `int` | `120` | | Width of right cheek editing region. (右脸颊编辑区域的宽度) |
-| `--side_protect_ratio` | `float` | `0.08` | | Side-edge blend protection ratio. (侧边融合边缘保护比例) |
+| `--parsing_mode` | `str` | `"jaw"` | `["jaw", "raw"]` | Face blending parsing mode (`"jaw"` allows open-jaw chin tips to extend onto central throat skin; `"raw"` restricts strictly to raw face/lip skin). (面部融合解析模式；`"jaw"` 允许张嘴下巴尖自然延展至正中颈部皮肤，`"raw"` 严格限制在原始面部/唇部区域内，含 `dynamic` 模式) |
+| `--left_cheek_width` | `int` | `90` | | Width of left cheek editing region; clamped to `[20, 90]` in `v1.5` to protect outer cheek silhouettes. (左脸颊编辑区域的宽度；`v1.5` 下自动安全钳制在 `[20, 90]` 以防腮边破边) |
+| `--right_cheek_width` | `int` | `90` | | Width of right cheek editing region; clamped to `[20, 90]` in `v1.5`. (右脸颊编辑区域的宽度；`v1.5` 下安全钳制在 `[20, 90]`) |
+| `--side_protect_ratio` | `float` | `0.15` | | Side-edge blend protection ratio; clamped to `[0.15, 0.45]` when enabled in `v1.5`. (侧边融合边缘保护比例；`v1.5` 启用时安全钳制在 `[0.15, 0.45]`) |
 | `--bbox_smooth_window` | `int` | `7` | | Centered moving-average window size for bounding box smoothing; Set to `1` to disable smoothing. (用于 bounding box 平滑的中心移动平均窗口大小；设为 `1` 将禁用平滑) |
 
 ---
@@ -97,7 +97,7 @@ The first four options below are **on by default** since 2026-11-20, after 4K A/
 | `--pause_fade_frames` | `int` | `4` | Frames used for each fade in and out. (渐入、渐出各用的帧数) |
 | `--pause_top_db` | `float` | `38.0` | Silence threshold below the audio peak, in dB; raise it for audio with background noise or music. (停顿检测门限，相对峰值的分贝数；有底噪或背景音乐时调大) |
 | `--use_audio_pe` | `bool` | `auto` | Add positional encoding to Whisper features (`true` for 256, `false` for 512 unless explicitly set). (音频位置编码；256 默认 `true`，512 默认 `false`) |
-| `--ref_frame_mode` | `str` | `auto` | UNet reference latent source: `self`, `first`, `offset`, `auto` (DWPose 68-pt closed-mouth frontal selection), or `dynamic` (pose+time nearest open/closed pools + open-jaw neck pre-healing). Defaults to `auto` for 512 and `self` for 256. (参考帧策略；新增 `dynamic` 支持姿态+时间最近邻张嘴/闭嘴参考帧切换与下巴颈部预修复；512 默认 `auto`，256 默认 `self`) |
+| `--ref_frame_mode` | `str` | `"dynamic"` | UNet reference latent source: `self`, `first`, `offset`, `auto` (DWPose 68-pt closed-mouth frontal selection), or `dynamic` (pose+time nearest open/closed pools + jaw-detail & throat-shadow restoration; auto-falls back to `self` on closed-mouth templates and single images). (参考帧策略；默认 `dynamic`，对闭嘴底板与单图自动无损回退 `self`，对开口讲课底板自动启用姿态+时间双参考池与下颌/喉部修复；旧值 `self`) |
 
 Reproduce the previous (pre-2026-11-20) output (复现旧版输出):
 
@@ -105,7 +105,7 @@ Reproduce the previous (pre-2026-11-20) output (复现旧版输出):
 python run_cli.py --face ./data/video/select_ref.mp4 --audio ./data/audio/monalisa.wav \
   --outfile ./output/result_legacy.mp4 \
   --vae_latent_mode sample --paste_interpolation linear --enhance_mode none \
-  --protect_upper_face false
+  --protect_upper_face false --ref_frame_mode self
 ```
 
 The final audio mux now copies the rendered video stream instead of re-encoding it, so the output keeps the single CRF 18 encode; files are larger than before. (合音轨改为直接拷贝视频流，避免二次有损编码；输出文件会比之前大。)
@@ -131,3 +131,7 @@ The final audio mux now copies the rendered video stream instead of re-encoding 
 | 2026-11-20 17:52:00 +08:00 | “内部运行机制”更新：每次运行使用唯一的临时任务文件 `temp_cli_task_*.yaml`；底层推理默认不再在输出目录的上级写人脸坐标文件（仅 `--saved_coord` 时写入）。 |
 | 2026-11-24 00:29:00 +08:00 | 补充 `--resolution`、`--unet_model_path`、`--unet_config`、`--batch_size`、`--use_float16`/`--no_float16` 与 `--ref_frame_mode` 说明：`v1.5` 检测到本地 `./models/musetalkV15_512/{unet.pth,musetalk.json}` 时默认自动启用 `512` 并联动安全默认值（`batch_size=2`、`use_float16=true`、`use_audio_pe=false`、`ref_frame_mode=auto`），无 512 权重或显式 `--resolution 256` 时保持旧版 `256` 行为。 |
 | 2026-11-27 18:20:00 +08:00 | 为 `--ref_frame_mode` 新增 `dynamic` 候选模式说明：利用 DWPose 68 点关键点构建张嘴（保留牙齿特征）与自然闭嘴双参考池，按姿态+时间最近邻与音频长停顿平滑路由，并对原底板张嘴帧做下巴/上颈部预修复以消除双下巴与喉结伪影。 |
+| 2026-11-28 11:48:00 +08:00 | 将 `run_cli.py` 默认 `left_cheek_width` / `right_cheek_width` 由 `120` 回调至与底层 `scripts/inference.py` 一致的 `90`，并将 `side_protect_ratio` 默认值调至 `0.15`，配合 `dynamic` 模式下的脸颊横向内缩保护消除两侧腮边上下拼接断层。 |
+| 2026-11-28 12:32:00 +08:00 | 在 `MuseTalk` 推理与动态融合内部新增脸颊宽度与侧边保护安全钳制（`cheek_width <= 90`、`side_protect_ratio >= 0.15` 及外轮廓最小内缩安全带），即使外部上游命令行显式传入旧参数（如 `120 / 0.08`）也自动防腮边破边。 |
+| 2026-11-28 15:18:00 +08:00 | 将 `run_cli.py` 与底层 `scripts/inference.py` 的默认 `--ref_frame_mode` 统一调整为 `"dynamic"`（闭嘴底板自动回退 `self`，开口底板自动启用动态参考池与下颌细节/喉部阴影恢复），并对齐 `scripts/inference.py` 的默认 `side_protect_ratio=0.15` 与 `bbox_smooth_window=7`。 |
+| 2026-11-28 15:39:00 +08:00 | 补充 `--parsing_mode`（`jaw` / `raw`）在常规与 `dynamic` 模式下的下巴尖颈部延展与原始皮肤约束说明，收紧融合掩码边界与前瞻帧错误隔离。 |

@@ -128,11 +128,14 @@ class RunCliPassThroughTest(unittest.TestCase):
         self.assertEqual(opts["--paste_interpolation"], "lanczos")
         self.assertEqual(opts["--enhance_mode"], "usm")
         self.assertEqual(opts["--protect_upper_face"], "true")
+        self.assertEqual(opts["--left_cheek_width"], "90")
+        self.assertEqual(opts["--right_cheek_width"], "90")
+        self.assertEqual(opts["--side_protect_ratio"], "0.15")
         self.assertEqual(opts["--fix_teeth_whiteness"], "false")
         self.assertEqual(opts["--close_mouth_pauses"], "false")
         self.assertEqual(opts["--pause_top_db"], "38.0")
         self.assertEqual(opts["--use_audio_pe"], "true")
-        self.assertEqual(opts["--ref_frame_mode"], "self")
+        self.assertEqual(opts["--ref_frame_mode"], "dynamic")
 
     def test_defaults_keep_256_even_when_512_weights_exist(self):
         """Unmodified v1.5 CLI defaults to robust 256 v1.5 even when local 512 weights exist."""
@@ -143,7 +146,7 @@ class RunCliPassThroughTest(unittest.TestCase):
         self.assertEqual(opts["--batch_size"], "8")
         self.assertNotIn("--use_float16", self.last_cmd)
         self.assertEqual(opts["--use_audio_pe"], "true")
-        self.assertEqual(opts["--ref_frame_mode"], "self")
+        self.assertEqual(opts["--ref_frame_mode"], "dynamic")
 
     def test_explicit_256_and_512_precision_overrides_work_when_512_weights_exist(self):
         """Explicit --resolution 512 with --no_float16/--batch_size overrides defaults cleanly."""
@@ -153,7 +156,7 @@ class RunCliPassThroughTest(unittest.TestCase):
         self.assertEqual(forced_256["--batch_size"], "8")
         self.assertNotIn("--use_float16", self.last_cmd)
         self.assertEqual(forced_256["--use_audio_pe"], "true")
-        self.assertEqual(forced_256["--ref_frame_mode"], "self")
+        self.assertEqual(forced_256["--ref_frame_mode"], "dynamic")
 
         forced_fp32 = self._run(["--resolution", "512", "--batch_size", "1", "--no_float16"], has_512_weights=True)
         self.assertEqual(forced_fp32["--resolution"], "512")
@@ -164,7 +167,7 @@ class RunCliPassThroughTest(unittest.TestCase):
         self.assertEqual(v10_opts["--resolution"], "256")
 
     def test_resolution_512_selects_512_weights_and_disables_audio_pe_by_default(self):
-        """Passing --resolution 512 routes to musetalkV15_512, bs=2, fp16, use_audio_pe=false, ref=auto."""
+        """Passing --resolution 512 routes to musetalkV15_512, bs=2, fp16, use_audio_pe=false, ref=dynamic."""
         opts = self._run(["--resolution", "512"])
         self.assertEqual(opts["--resolution"], "512")
         self.assertEqual(opts["--version"], "v15")
@@ -173,7 +176,7 @@ class RunCliPassThroughTest(unittest.TestCase):
         self.assertEqual(opts["--batch_size"], "2")
         self.assertIn("--use_float16", self.last_cmd)
         self.assertEqual(opts["--use_audio_pe"], "false")
-        self.assertEqual(opts["--ref_frame_mode"], "auto")
+        self.assertEqual(opts["--ref_frame_mode"], "dynamic")
 
     def test_resolution_512_respects_explicit_model_and_audio_pe_overrides(self):
         """Explicit UNet path, config, use_audio_pe, and ref_frame_mode flags override defaults."""
@@ -191,15 +194,17 @@ class RunCliPassThroughTest(unittest.TestCase):
         self.assertEqual(opts["--ref_frame_mode"], "first")
 
     def test_ref_frame_mode_default_and_override(self):
-        """run_cli defaults --ref_frame_mode to self for 256, auto for 512, and forwards explicit modes."""
+        """run_cli defaults --ref_frame_mode to dynamic across resolutions and forwards explicit modes."""
         default_256 = self._run([])
-        self.assertEqual(default_256["--ref_frame_mode"], "self")
+        self.assertEqual(default_256["--ref_frame_mode"], "dynamic")
         default_512 = self._run(["--resolution", "512"])
-        self.assertEqual(default_512["--ref_frame_mode"], "auto")
+        self.assertEqual(default_512["--ref_frame_mode"], "dynamic")
         offset_opts = self._run(["--resolution", "512", "--ref_frame_mode", "offset"])
         self.assertEqual(offset_opts["--ref_frame_mode"], "offset")
         self_opts = self._run(["--resolution", "512", "--ref_frame_mode", "self"])
         self.assertEqual(self_opts["--ref_frame_mode"], "self")
+        self_256 = self._run(["--ref_frame_mode", "self"])
+        self.assertEqual(self_256["--ref_frame_mode"], "self")
         auto_256 = self._run(["--ref_frame_mode", "auto"])
         self.assertEqual(auto_256["--ref_frame_mode"], "auto")
         dynamic_256 = self._run(["--ref_frame_mode", "dynamic"])

@@ -16,9 +16,10 @@ while ``self`` reference leaks source mouth openings during silent pauses.
 3. Evaluates ``[masked_latent, ref_latent]`` lazily per frame via
    :class:`DynamicLatentSequence` so GPU memory stays ``O(batch_size)``
    regardless of output audio length.
-4. Pre-heals open-jaw source frames' lower-chin / upper-neck region with the
-   pose-aligned nearest ``closed_pool`` frame inside a semantic skin/neck
-   intersection mask to eliminate double-chin and Adam's-apple artifacts.
+4. Pre-heals open-jaw source frames' dropped-chin bulge and sub-mental crease
+   using same-frame upper-throat skin continuation inside a semantic skin/neck
+   mask (with zero cross-frame neck warping), eliminating double-chin and
+   Adam's-apple artifacts while keeping the neck 100% stationary.
 """
 
 from collections import OrderedDict
@@ -26,15 +27,15 @@ import math
 
 import numpy as np
 
-from musetalk.utils.clarity import gaussian_blur_2d, score_landmark_neutral_ref
+from musetalk.utils.clarity import (
+    gaussian_blur_2d,
+    gaussian_kernel_1d,
+    score_landmark_neutral_ref,
+)
 from musetalk.utils.ref_align import (
     DEFAULT_MAX_YAW_DELTA,
-    DEFAULT_MIN_IN_BOUNDS_RATIO,
     RIGID_UPPER_FACE_INDICES,
     align_reference_face_crop,
-    compose_aligned_crop_matrix,
-    compute_crop_in_bounds_ratio,
-    estimate_rigid_face_similarity,
 )
 
 # Minimum inner-mouth bright neutral-pixel fraction indicating visible teeth.
@@ -530,6 +531,14 @@ def build_dynamic_reference_plan(
     closed_weights = build_dynamic_closed_weights(
         voiced_intervals, total_output_frames, fps=fps
     )
+    neutral_chin_ratio, neutral_mar = compute_neutral_chin_stats(
+        landmarks_list, pools_info["closed_pool"]
+    )
+    chin_heal_strengths = build_smoothed_chin_heal_strengths(
+        landmarks_list,
+        neutral_chin_ratio=neutral_chin_ratio,
+        neutral_mar=neutral_mar,
+    )
     return {
         "pools_info": pools_info,
         "nearest_open_by_source": nearest_open,
@@ -538,6 +547,9 @@ def build_dynamic_reference_plan(
         "open_ref_seq": open_ref_seq,
         "closed_ref_seq": closed_ref_seq,
         "closed_weights": closed_weights,
+        "neutral_chin_ratio": neutral_chin_ratio,
+        "neutral_mar": neutral_mar,
+        "chin_heal_strengths": chin_heal_strengths,
     }
 
 
@@ -768,111 +780,280 @@ def build_dynamic_unet_latents(
     )
 
 
+def _extract_chin_pose_metrics(landmarks_68):
+    """Extract roll-invariant eye-to-chin projection, IOD, eye midpoint, and MAR."""
+    if landmarks_68 is None:
+        return None
+    pts = np.asarray(landmarks_68, dtype=np.float32)
+    if pts.shape != (68, 2) or not np.all(np.isfinite(pts)):
+        return None
+    scored = score_landmark_neutral_ref(pts)
+    if scored is None:
+        return None
+    left_eye = pts[36:42].mean(axis=0)
+    right_eye = pts[42:48].mean(axis=0)
+    eye_vec = right_eye - left_eye
+    iod = float(np.linalg.norm(eye_vec))
+    if iod < 1e-3:
+        return None
+    u_axis = eye_vec / iod
+    down_axis = np.array([-u_axis[1], u_axis[0]], dtype=np.float32)
+    eye_mid = 0.5 * (left_eye + right_eye)
+    chin_proj = float(np.dot(pts[8] - eye_mid, down_axis))
+    return {
+        "pts": pts,
+        "mar": float(scored[0]),
+        "iod": iod,
+        "eye_mid": eye_mid,
+        "down_axis": down_axis,
+        "chin_proj": chin_proj,
+        "chin_ratio": chin_proj / iod,
+    }
+
+
+def compute_neutral_chin_stats(landmarks_list, closed_pool=None):
+    """Estimate calm closed-mouth ``(neutral_chin_ratio, neutral_mar)`` from source landmarks.
+
+    Args:
+        landmarks_list (Sequence | None): Per-source-frame ``(68, 2)`` landmarks.
+        closed_pool (Sequence[int] | None): Indices of calm closed-mouth frames.
+
+    Returns:
+        tuple[float, float]: ``(neutral_chin_ratio, neutral_mar)``.
+    """
+    if not landmarks_list:
+        return 1.75, 0.025
+    indices = list(closed_pool) if closed_pool else list(range(len(landmarks_list)))
+    ratios, mars = [], []
+    for idx in indices:
+        if 0 <= int(idx) < len(landmarks_list):
+            m = _extract_chin_pose_metrics(landmarks_list[int(idx)])
+            if m is not None:
+                ratios.append(m["chin_ratio"])
+                mars.append(m["mar"])
+    if not ratios:
+        for lm in landmarks_list:
+            m = _extract_chin_pose_metrics(lm)
+            if m is not None:
+                ratios.append(m["chin_ratio"])
+                mars.append(m["mar"])
+    if not ratios:
+        return 1.75, 0.025
+    return float(np.median(ratios)), float(np.median(mars))
+
+
+def _raw_chin_heal_strength(metrics, neutral_chin_ratio, neutral_mar):
+    """Compute instantaneous open-jaw sub-chin heal strength in ``[0, 1]``."""
+    mar_gate = float(np.clip((metrics["mar"] - (float(neutral_mar) + 0.010)) / 0.030, 0.0, 1.0))
+    if mar_gate <= 1e-4:
+        return 0.0
+    chin_drop_norm = max(0.0, metrics["chin_ratio"] - float(neutral_chin_ratio))
+    mar_drop_norm = max(0.0, metrics["mar"] - float(neutral_mar)) * 0.55
+    eff_drop_norm = max(chin_drop_norm, mar_drop_norm)
+    drop_ramp = float(np.clip((eff_drop_norm - 0.015) / 0.075, 0.0, 1.0))
+    return mar_gate * drop_ramp
+
+
+def build_smoothed_chin_heal_strengths(
+    landmarks_list,
+    neutral_chin_ratio=1.75,
+    neutral_mar=0.025,
+):
+    """Compute 5-frame temporally smoothed sub-chin heal strengths per source frame.
+
+    Carries the last valid strength across missing-landmark frames and pads
+    edges symmetrically so ping-pong cycle turnarounds remain continuous.
+
+    Args:
+        landmarks_list (Sequence | None): Per-source-frame ``(68, 2)`` landmarks.
+        neutral_chin_ratio (float): Closed-mouth ``chin_proj / iod`` baseline.
+        neutral_mar (float): Closed-mouth inner-lip MAR baseline.
+
+    Returns:
+        np.ndarray: ``float32`` array of shape ``(len(landmarks_list),)``.
+    """
+    n = len(landmarks_list) if landmarks_list is not None else 0
+    if n == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    raw = np.zeros(n, dtype=np.float32)
+    last_val = 0.0
+    for idx in range(n):
+        m = _extract_chin_pose_metrics(landmarks_list[idx])
+        if m is not None:
+            last_val = _raw_chin_heal_strength(m, neutral_chin_ratio, neutral_mar)
+        raw[idx] = last_val
+
+    if n < 3:
+        return raw
+    kernel = np.array([0.15, 0.20, 0.30, 0.20, 0.15], dtype=np.float32)
+    padded = np.pad(raw, (2, 2), mode="edge")
+    return np.convolve(padded, kernel, mode="valid").astype(np.float32)
+
+
+def _smooth_horizontal_profile(profile_bgr, sigma=3.0):
+    """Smooth a ``(W, 3)`` BGR profile along X with a 1-D Gaussian in pure NumPy."""
+    kernel = gaussian_kernel_1d(sigma)
+    radius = len(kernel) // 2
+    padded = np.pad(profile_bgr.astype(np.float32, copy=False), ((radius, radius), (0, 0)), mode="edge")
+    out = np.zeros_like(profile_bgr, dtype=np.float32)
+    width = profile_bgr.shape[0]
+    for offset, weight in enumerate(kernel):
+        out += float(weight) * padded[offset : offset + width]
+    return out
+
+
 def compute_healed_neck_roi(
     ori_frame,
     ori_landmarks,
     face_box,
-    ref_closed_frame,
-    ref_closed_landmarks,
+    ref_closed_frame=None,
+    ref_closed_landmarks=None,
     fp=None,
+    neutral_chin_ratio=None,
+    neutral_mar=None,
+    strength_override=None,
 ):
-    """Pre-heal an open-jaw source frame's lower-chin and upper-neck ROI.
+    """Pre-heal an open-jaw source frame's dropped-chin bulge and sub-mental crease.
 
-    Replaces the dropped open-jaw chin shadow on ``ori_frame``'s neck with the
-    pose-aligned clean neck from ``ref_closed_frame``, restricted to the semantic
-    skin+neck intersection so hair, clothing, and green-screen background are
-    never touched.
+    Projects ``ori_frame``'s own clean upper-throat skin (immediately below the
+    dropped-chin rim in the same frame) upward across the narrow sub-chin band
+    ``[top_y, open_chin_y + 0.035 * fh]`` within ``chin_x +/- 0.34 * fw``.
+    Performs zero cross-frame warping and modifies zero pixels on the neck below
+    ``open_chin_y + 0.035 * fh`` or on the left/right neck borders, eliminating
+    double-chin / Adam's-apple artifacts with zero neck jitter.
 
     Args:
         ori_frame (np.ndarray): Target source BGR frame ``(H, W, 3)``.
         ori_landmarks (np.ndarray | None): ``(68, 2)`` landmarks of ``ori_frame``.
         face_box (Sequence[int]): Adjusted crop box ``(x1, y1, x2, y2)``.
-        ref_closed_frame (np.ndarray): Closed-mouth BGR frame ``(H, W, 3)``.
-        ref_closed_landmarks (np.ndarray | None): ``(68, 2)`` landmarks of ``ref_closed_frame``.
+        ref_closed_frame (np.ndarray | None): Unused legacy parameter kept for
+            API compatibility (never warped).
+        ref_closed_landmarks (np.ndarray | None): Optional closed-mouth landmarks
+            used to derive ``neutral_chin_ratio`` / ``neutral_mar`` when omitted.
         fp (Callable | None): Optional ``FaceParsing`` callable supporting ``mode="neck"``.
+        neutral_chin_ratio (float | None): Closed-mouth ``chin_proj / iod`` baseline.
+        neutral_mar (float | None): Closed-mouth inner-lip MAR baseline.
+        strength_override (float | None): Optional temporally smoothed strength in ``[0, 1]``.
 
     Returns:
         tuple[tuple[int, int, int, int], np.ndarray] | None: ``((rx1, ry1, rx2, ry2), healed_roi)``
-            or ``None`` when ``ori_frame``'s jaw is already closed or unaligned.
+            or ``None`` when ``ori_frame``'s jaw is closed, invalid, or occluded by clothing.
     """
-    ori_scored = score_landmark_neutral_ref(ori_landmarks)
-    ref_scored = score_landmark_neutral_ref(ref_closed_landmarks)
-    if ori_scored is None or ref_scored is None:
+    del ref_closed_frame
+    if ori_frame is None or getattr(ori_frame, "ndim", 0) != 3 or ori_frame.shape[2] != 3:
+        return None
+    ori_m = _extract_chin_pose_metrics(ori_landmarks)
+    if ori_m is None:
         return None
 
-    mar_ori, mar_ref = float(ori_scored[0]), float(ref_scored[0])
-    strength = float(np.clip((mar_ori - 0.040) / 0.030, 0.0, 1.0))
-    if strength <= 1e-3 or mar_ori <= mar_ref + 0.012:
-        return None
+    if neutral_chin_ratio is None or neutral_mar is None:
+        ref_m = _extract_chin_pose_metrics(ref_closed_landmarks)
+        if neutral_chin_ratio is None:
+            neutral_chin_ratio = ref_m["chin_ratio"] if ref_m is not None else 1.75
+        if neutral_mar is None:
+            neutral_mar = ref_m["mar"] if ref_m is not None else 0.025
 
-    sim_matrix, status = estimate_rigid_face_similarity(ref_closed_landmarks, ori_landmarks)
-    if status != "aligned" or sim_matrix is None:
+    if strength_override is not None:
+        strength = float(np.clip(strength_override, 0.0, 1.0))
+    else:
+        strength = _raw_chin_heal_strength(ori_m, neutral_chin_ratio, neutral_mar)
+    if strength <= 1e-3:
         return None
 
     img_h, img_w = ori_frame.shape[:2]
     x1, y1, x2, y2 = [int(v) for v in face_box]
     fw, fh = float(x2 - x1), float(y2 - y1)
-    if fw <= 4.0 or fh <= 4.0:
+    if fw <= 8.0 or fh <= 8.0:
         return None
 
-    cx = 0.5 * (x1 + x2)
-    rx1 = max(0, int(round(cx - 0.85 * fw)))
-    rx2 = min(img_w, int(round(cx + 0.85 * fw)))
-    ry1 = max(0, int(round(y1 + 0.35 * fh)))
-    ry2 = min(img_h, int(round(y2 + 0.35 * fh)))
-    rw, rh = rx2 - rx1, ry2 - ry1
-    if rw <= 4 or rh <= 4:
-        return None
-
-    crop_matrix = compose_aligned_crop_matrix(sim_matrix, (rx1, ry1, rx2, ry2), (rw, rh))
-    if compute_crop_in_bounds_ratio(crop_matrix, (rw, rh), ref_closed_frame.shape) < DEFAULT_MIN_IN_BOUNDS_RATIO:
-        return None
-
-    import cv2
-    from PIL import Image
-
-    warped_ref = cv2.warpAffine(
-        ref_closed_frame,
-        crop_matrix,
-        (rw, rh),
-        flags=cv2.INTER_LANCZOS4,
-        borderMode=cv2.BORDER_REPLICATE,
+    pts = ori_m["pts"]
+    chin_x = float(pts[8, 0])
+    open_chin_y = float(pts[8, 1])
+    neutral_chin_y = float(
+        ori_m["eye_mid"][1] + float(neutral_chin_ratio) * ori_m["iod"] * float(ori_m["down_axis"][1])
     )
-    roi_tgt = ori_frame[ry1:ry2, rx1:rx2]
 
+    top_y = min(neutral_chin_y - 0.04 * fh, open_chin_y - 0.14 * fh)
+    bot_y = open_chin_y + 0.035 * fh
+    rx1 = max(0, int(round(chin_x - 0.34 * fw)))
+    rx2 = min(img_w, int(round(chin_x + 0.34 * fw)))
+    ry1 = max(0, int(round(top_y)))
+    ry2 = min(img_h, int(round(bot_y)))
+    rw, rh = rx2 - rx1, ry2 - ry1
+    if rw <= 6 or rh <= 4:
+        return None
+
+    sy1 = max(0, min(img_h - 2, int(round(open_chin_y + 0.045 * fh))))
+    sy2 = max(sy1 + 2, min(img_h, int(round(open_chin_y + 0.115 * fh))))
+    if sy2 - sy1 < 2:
+        return None
+
+    soft_sem = np.ones((rh, rw), dtype=np.float32)
+    m_throat = None
+    if fp is not None:
+        from PIL import Image
+
+        pad = int(round(0.25 * fw))
+        px1 = max(0, min(x1, rx1) - pad)
+        py1 = max(0, min(y1, ry1))
+        px2 = min(img_w, max(x2, rx2) + pad)
+        py2 = min(img_h, max(ry2, sy2) + pad)
+        pw, ph = px2 - px1, py2 - py1
+        if pw <= 4 or ph <= 4:
+            return None
+        m_full = np.asarray(
+            fp(Image.fromarray(ori_frame[py1:py2, px1:px2, ::-1]), mode="neck").resize(
+                (pw, ph), Image.BILINEAR
+            )
+        )
+        m_roi = m_full[ry1 - py1 : ry2 - py1, rx1 - px1 : rx2 - px1] > 127
+        m_throat = m_full[sy1 - py1 : sy2 - py1, rx1 - px1 : rx2 - px1] > 127
+        if not np.any(m_roi) or int(np.count_nonzero(m_throat)) < max(8, int(0.20 * m_throat.size)):
+            return None
+        blurred = gaussian_blur_2d(m_roi.astype(np.float32), 2.0)
+        soft_sem = np.where(m_roi, np.clip((blurred - 0.4) * 1.8, 0.0, 1.0), 0.0).astype(np.float32)
+
+    throat_strip = ori_frame[sy1:sy2, rx1:rx2].astype(np.float32)
+    if m_throat is not None:
+        col_med = np.zeros((rw, 3), dtype=np.float32)
+        valid_cols = []
+        for col in range(rw):
+            col_mask = m_throat[:, col]
+            if np.any(col_mask):
+                col_med[col] = np.median(throat_strip[col_mask, col], axis=0)
+                valid_cols.append(col)
+        if not valid_cols:
+            return None
+        if len(valid_cols) < rw:
+            vx = np.asarray(valid_cols, dtype=np.float32)
+            all_x = np.arange(rw, dtype=np.float32)
+            for ch in range(3):
+                col_med[:, ch] = np.interp(all_x, vx, col_med[valid_cols, ch])
+    else:
+        col_med = np.median(throat_strip, axis=0)
+
+    col_smooth = _smooth_horizontal_profile(col_med, sigma=3.0)
     ys = np.arange(ry1, ry2, dtype=np.float32)
     xs = np.arange(rx1, rx2, dtype=np.float32)
-    t_top = np.clip((ys - (y1 + 0.50 * fh)) / max(0.12 * fh, 1.0), 0.0, 1.0)
-    t_bot = np.clip(((y2 + 0.28 * fh) - ys) / max(0.16 * fh, 1.0), 0.0, 1.0)
+    crease_anchor_y = min(neutral_chin_y, open_chin_y - 0.06 * fh) + 0.02 * fh
+    shade = 1.0 - 0.035 * np.exp(-0.5 * ((ys - crease_anchor_y) / max(0.03 * fh, 2.0)) ** 2)
+    fill_bgr = col_smooth[np.newaxis, :, :] * shade[:, np.newaxis, np.newaxis]
+
+    t_top = np.clip((ys - top_y) / max(0.05 * fh, 2.0), 0.0, 1.0)
+    t_bot = np.clip((bot_y - ys) / max(0.035 * fh, 2.0), 0.0, 1.0)
     wy = (0.5 * (1.0 - np.cos(np.pi * t_top))) * (0.5 * (1.0 - np.cos(np.pi * t_bot)))
 
-    dx = np.abs(xs - cx)
-    tx = np.clip((0.78 * fw - dx) / max(0.23 * fw, 1.0), 0.0, 1.0)
+    dx = np.abs(xs - chin_x)
+    tx = np.clip((0.33 * fw - dx) / max(0.11 * fw, 2.0), 0.0, 1.0)
     wx = 0.5 * (1.0 - np.cos(np.pi * tx))
 
-    valid_skin_neck = np.ones((rh, rw), dtype=bool)
-    soft_sem = np.ones((rh, rw), dtype=np.float32)
-    if fp is not None:
-        m_tgt = np.asarray(fp(Image.fromarray(roi_tgt[:, :, ::-1]), mode="neck").resize((rw, rh), Image.BILINEAR))
-        m_ref = np.asarray(fp(Image.fromarray(warped_ref[:, :, ::-1]), mode="neck").resize((rw, rh), Image.BILINEAR))
-        valid_skin_neck = (m_tgt > 127) & (m_ref > 127)
-        if not np.any(valid_skin_neck):
-            return None
-        blurred = gaussian_blur_2d(valid_skin_neck.astype(np.float32), 2.0)
-        soft_sem = np.where(valid_skin_neck, np.clip((blurred - 0.5) * 2.0, 0.0, 1.0), 0.0).astype(np.float32)
-
-    alpha = (strength * wy[:, np.newaxis] * wx[np.newaxis, :] * soft_sem).astype(np.float32)
+    alpha = np.clip(strength * wy[:, np.newaxis] * wx[np.newaxis, :] * soft_sem, 0.0, 1.0).astype(np.float32)
     if float(alpha.max()) <= 1e-3:
         return None
 
-    tgt_f = roi_tgt.astype(np.float32)
-    ref_f = warped_ref.astype(np.float32)
-    tone_ring = valid_skin_neck & ((ys >= (y2 + 0.08 * fh))[:, np.newaxis]) & ((ys <= (y2 + 0.26 * fh))[:, np.newaxis])
-    if int(np.count_nonzero(tone_ring)) >= 25:
-        delta_bgr = np.clip(np.median(tgt_f[tone_ring] - ref_f[tone_ring], axis=0), -10.0, 10.0)
-        ref_f = np.clip(ref_f + delta_bgr, 0.0, 255.0)
-
-    blended = tgt_f * (1.0 - alpha[:, :, np.newaxis]) + ref_f * alpha[:, :, np.newaxis]
+    roi_tgt = ori_frame[ry1:ry2, rx1:rx2].astype(np.float32)
+    blended = roi_tgt * (1.0 - alpha[:, :, np.newaxis]) + fill_bgr * alpha[:, :, np.newaxis]
     return (rx1, ry1, rx2, ry2), np.clip(np.rint(blended), 0, 255).astype(np.uint8)
 
 

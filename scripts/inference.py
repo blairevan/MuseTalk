@@ -57,11 +57,13 @@ from musetalk.utils.ref_align import (
     plan_reference_frame_mode,
 )
 from musetalk.utils.dynamic_ref import (
-    apply_healed_neck_roi,
     build_dynamic_reference_plan,
     build_dynamic_unet_latents,
-    compute_healed_neck_roi,
     make_resilient_ref_encoder,
+)
+from musetalk.utils.throat_chin_blend import (
+    DynamicChinThroatCoordinator,
+    clamp_blend_safety_params,
 )
 from musetalk.utils.frame_io import FrameSequence
 from musetalk.utils.resource_utils import release_torch_resources
@@ -691,10 +693,29 @@ def main(args):
                 self_ref_crops_by_source = None
                 adjusted_boxes_by_source = None
 
+            eff_left_cheek_w = args.left_cheek_width
+            eff_right_cheek_w = args.right_cheek_width
+            eff_side_protect = args.side_protect_ratio
             if args.version == "v15":
+                eff_left_cheek_w, eff_right_cheek_w, eff_side_protect = clamp_blend_safety_params(
+                    args.left_cheek_width,
+                    args.right_cheek_width,
+                    args.side_protect_ratio,
+                    force_min_side_protect=(effective_ref_mode != "self"),
+                )
+                if (
+                    eff_left_cheek_w != args.left_cheek_width
+                    or eff_right_cheek_w != args.right_cheek_width
+                    or abs(eff_side_protect - args.side_protect_ratio) > 1e-6
+                ):
+                    print(
+                        f"Blend safety clamp applied: cheek_width=({args.left_cheek_width}, {args.right_cheek_width})->"
+                        f"({eff_left_cheek_w}, {eff_right_cheek_w}), "
+                        f"side_protect_ratio={args.side_protect_ratio}->{eff_side_protect}"
+                    )
                 fp = FaceParsing(
-                    left_cheek_width=args.left_cheek_width,
-                    right_cheek_width=args.right_cheek_width
+                    left_cheek_width=eff_left_cheek_w,
+                    right_cheek_width=eff_right_cheek_w
                 )
             else:
                 fp = FaceParsing()
@@ -769,143 +790,198 @@ def main(args):
                     interpolation=cv2.INTER_LANCZOS4,
                 )
 
-            healed_neck_roi_cache = OrderedDict()
-            max_neck_roi_cache = 256
-            healed_neck_count = 0
-            evaluated_neck_sources = set()
-
-            for i, res_frame in enumerate(tqdm(res_frame_list)):
-                source_index = frame_index_cycle[i % len(frame_index_cycle)]
-                bbox = coord_list[source_index]
-                ori_frame = frames[source_index]
-                x1, y1, x2, y2 = bbox
-                
-                # If no face is detected or coordinate is invalid, fallback to original frame to avoid sequence gap
-                if bbox == coord_placeholder or (x2 - x1) <= 0 or (y2 - y1) <= 0:
-                    cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", ori_frame)
-                    continue
-                
-                if args.version == "v15":
-                    x1, y1, x2, y2 = adjust_face_box(
-                        bbox,
-                        ori_frame.shape,
-                        bbox_left_ratio=args.bbox_left_ratio,
-                        bbox_right_ratio=args.bbox_right_ratio,
-                        bbox_top_ratio=args.bbox_top_ratio,
-                        bbox_bottom_ratio=args.bbox_bottom_ratio
-                    )
-                    y2 = y2 + args.extra_margin
-                    y2 = min(y2, ori_frame.shape[0])
-
-                if dynamic_plan is not None:
-                    if source_index in healed_neck_roi_cache:
-                        healed_neck_roi_cache.move_to_end(source_index)
-                    else:
-                        j_closed = dynamic_plan["nearest_closed_by_source"][source_index]
-                        roi_patch = None
-                        if j_closed != source_index:
-                            try:
-                                roi_patch = compute_healed_neck_roi(
-                                    ori_frame,
-                                    landmarks_list[source_index],
-                                    (x1, y1, x2, y2),
-                                    frames[j_closed],
-                                    landmarks_list[j_closed],
-                                    fp=fp,
-                                )
-                            except Exception as heal_err:
-                                print(f"Warning: neck pre-heal skipped for source {source_index}: {heal_err}")
-                        healed_neck_roi_cache[source_index] = roi_patch
-                        if len(healed_neck_roi_cache) > max_neck_roi_cache:
-                            healed_neck_roi_cache.popitem(last=False)
-                        if source_index not in evaluated_neck_sources:
-                            evaluated_neck_sources.add(source_index)
-                            if roi_patch is not None:
-                                healed_neck_count += 1
-                    ori_frame = apply_healed_neck_roi(ori_frame, healed_neck_roi_cache[source_index])
-
-                pause_weight = float(pause_weights[i]) if i < len(pause_weights) else 0.0
+            if dynamic_plan is not None:
                 has_neutral_face = neutral_face is not None and neutral_face.size > 0
-                should_close_mouth = (
-                    (i < active_audio_start_frame and args.close_mouth_start)
-                    or (i >= active_audio_end_frame and args.close_mouth_end)
-                    or (pause_weight >= 1.0 and has_neutral_face)
-                )
-                if should_close_mouth:
+
+                def _prepare_dynamic_frame(frame_idx):
+                    """Prepare resized/enhanced face crop and detail weight for frame_idx."""
+                    src_i = frame_index_cycle[frame_idx % len(frame_index_cycle)]
+                    raw_bbox = coord_list[src_i]
+                    ori_f = frames[src_i]
+                    bx1, by1, bx2, by2 = raw_bbox
+                    if raw_bbox == coord_placeholder or (bx2 - bx1) <= 0 or (by2 - by1) <= 0:
+                        return src_i, None, None, 0.0
+                    if args.version == "v15":
+                        bx1, by1, bx2, by2 = adjust_face_box(
+                            raw_bbox,
+                            ori_f.shape,
+                            bbox_left_ratio=args.bbox_left_ratio,
+                            bbox_right_ratio=args.bbox_right_ratio,
+                            bbox_top_ratio=args.bbox_top_ratio,
+                            bbox_bottom_ratio=args.bbox_bottom_ratio,
+                        )
+                        by2 = min(by2 + args.extra_margin, ori_f.shape[0])
+                    else:
+                        bx1 = max(0, int(bx1))
+                        by1 = max(0, int(by1))
+                        bx2 = min(ori_f.shape[1], int(bx2))
+                        by2 = min(ori_f.shape[0], int(by2))
+                    if (bx2 - bx1) <= 0 or (by2 - by1) <= 0:
+                        return src_i, None, None, 0.0
+
+                    pw = float(pause_weights[frame_idx]) if frame_idx < len(pause_weights) else 0.0
+                    close_now = (
+                        (frame_idx < active_audio_start_frame and args.close_mouth_start)
+                        or (frame_idx >= active_audio_end_frame and args.close_mouth_end)
+                        or (pw >= 1.0 and has_neutral_face)
+                    )
+                    if close_now:
+                        try:
+                            if not has_neutral_face:
+                                raise ValueError("Neutral reference face is unavailable")
+                            c_face = _build_closed_face_for_frame(src_i, (bx1, by1, bx2, by2))
+                            return src_i, (bx1, by1, bx2, by2), c_face, 0.0
+                        except Exception as close_err:
+                            print(f"Warning: failed to blend neutral mouth at frame {frame_idx}: {close_err}")
+                            return src_i, None, None, 0.0
+
                     try:
-                        if not has_neutral_face:
-                            raise ValueError("Neutral reference face is unavailable")
+                        gen_face = resize_generated_face(
+                            res_frame_list[frame_idx],
+                            bx2 - bx1,
+                            by2 - by1,
+                            mode=args.paste_interpolation,
+                        )
+                    except Exception:
+                        return src_i, None, None, 0.0
+
+                    gen_face = enhance_generated_face(gen_face, args, fp)
+                    detail_w = 1.0
+                    if pw > 0.0 and has_neutral_face:
+                        try:
+                            c_face = _build_closed_face_for_frame(src_i, (bx1, by1, bx2, by2))
+                            gen_face = blend_faces(gen_face, c_face, pw)
+                            detail_w = max(0.0, 1.0 - pw)
+                        except Exception as pause_err:
+                            print(f"Warning: failed to fade pause mouth at frame {frame_idx}: {pause_err}")
+                    return src_i, (bx1, by1, bx2, by2), gen_face, detail_w
+
+                coordinator = DynamicChinThroatCoordinator(
+                    total_frames=len(res_frame_list),
+                    frames=frames,
+                    landmarks_list=landmarks_list,
+                    fp=fp,
+                    prepare_frame_fn=_prepare_dynamic_frame,
+                    parsing_mode=args.parsing_mode if args.version == "v15" else "raw",
+                    left_cheek_width=eff_left_cheek_w if args.version == "v15" else 80,
+                    right_cheek_width=eff_right_cheek_w if args.version == "v15" else 80,
+                    side_protect_ratio=eff_side_protect if args.version == "v15" else 0.0,
+                    protect_upper_face=args.protect_upper_face,
+                )
+                for i in tqdm(range(len(res_frame_list))):
+                    src_i = frame_index_cycle[i % len(frame_index_cycle)]
+                    try:
+                        combine_frame = coordinator.render_frame(i)
+                    except Exception as dyn_err:
+                        print(f"Warning: dynamic chin/throat blend fallback at frame {i}: {dyn_err}")
+                        combine_frame = frames[src_i]
+                    cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", combine_frame)
+
+                print(
+                    f"Dynamic throat-shadow lift & jaw-detail restore: lifted "
+                    f"{len(coordinator.lifted_source_frames)}/"
+                    f"{len(coordinator.evaluated_source_frames)} unique source frames"
+                )
+                coordinator = None
+            else:
+                for i, res_frame in enumerate(tqdm(res_frame_list)):
+                    source_index = frame_index_cycle[i % len(frame_index_cycle)]
+                    bbox = coord_list[source_index]
+                    ori_frame = frames[source_index]
+                    x1, y1, x2, y2 = bbox
+
+                    # If no face is detected or coordinate is invalid, fallback to original frame to avoid sequence gap
+                    if bbox == coord_placeholder or (x2 - x1) <= 0 or (y2 - y1) <= 0:
+                        cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", ori_frame)
+                        continue
+
+                    if args.version == "v15":
+                        x1, y1, x2, y2 = adjust_face_box(
+                            bbox,
+                            ori_frame.shape,
+                            bbox_left_ratio=args.bbox_left_ratio,
+                            bbox_right_ratio=args.bbox_right_ratio,
+                            bbox_top_ratio=args.bbox_top_ratio,
+                            bbox_bottom_ratio=args.bbox_bottom_ratio
+                        )
+                        y2 = y2 + args.extra_margin
+                        y2 = min(y2, ori_frame.shape[0])
+
+                    pause_weight = float(pause_weights[i]) if i < len(pause_weights) else 0.0
+                    has_neutral_face = neutral_face is not None and neutral_face.size > 0
+                    should_close_mouth = (
+                        (i < active_audio_start_frame and args.close_mouth_start)
+                        or (i >= active_audio_end_frame and args.close_mouth_end)
+                        or (pause_weight >= 1.0 and has_neutral_face)
+                    )
+                    if should_close_mouth:
+                        try:
+                            if not has_neutral_face:
+                                raise ValueError("Neutral reference face is unavailable")
+                            closed_face = _build_closed_face_for_frame(source_index, (x1, y1, x2, y2))
+                            if args.version == "v15":
+                                combine_frame = get_image(
+                                    ori_frame,
+                                    closed_face,
+                                    [x1, y1, x2, y2],
+                                    mode=args.parsing_mode,
+                                    fp=fp,
+                                    side_protect_ratio=eff_side_protect,
+                                    protect_upper_face=args.protect_upper_face,
+                                )
+                            else:
+                                combine_frame = get_image(
+                                    ori_frame,
+                                    closed_face,
+                                    [x1, y1, x2, y2],
+                                    fp=fp,
+                                    protect_upper_face=args.protect_upper_face,
+                                )
+                            cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", combine_frame)
+                        except Exception as e:
+                            print(f"Warning: failed to blend neutral mouth at frame {i}: {e}")
+                            cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", ori_frame)
+                        continue
+
+                    try:
+                        res_frame = resize_generated_face(
+                            res_frame, x2 - x1, y2 - y1, mode=args.paste_interpolation
+                        )
+                    except Exception as e:
+                        cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", ori_frame)
+                        continue
+
+                    # Opt-in teeth correction and lip sharpening of the generated face
+                    res_frame = enhance_generated_face(res_frame, args, fp)
+
+                    # Fade toward the neutral mouth at the edges of mid-sentence pauses
+                    if pause_weight > 0.0 and has_neutral_face:
                         closed_face = _build_closed_face_for_frame(source_index, (x1, y1, x2, y2))
+                        res_frame = blend_faces(res_frame, closed_face, pause_weight)
+
+                    # Merge results with version-specific parameters
+                    try:
                         if args.version == "v15":
                             combine_frame = get_image(
                                 ori_frame,
-                                closed_face,
+                                res_frame,
                                 [x1, y1, x2, y2],
                                 mode=args.parsing_mode,
                                 fp=fp,
-                                side_protect_ratio=args.side_protect_ratio,
+                                side_protect_ratio=eff_side_protect,
                                 protect_upper_face=args.protect_upper_face,
                             )
                         else:
                             combine_frame = get_image(
                                 ori_frame,
-                                closed_face,
+                                res_frame,
                                 [x1, y1, x2, y2],
                                 fp=fp,
                                 protect_upper_face=args.protect_upper_face,
                             )
                         cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", combine_frame)
                     except Exception as e:
-                        print(f"Warning: failed to blend neutral mouth at frame {i}: {e}")
                         cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", ori_frame)
-                    continue
-
-                try:
-                    res_frame = resize_generated_face(
-                        res_frame, x2 - x1, y2 - y1, mode=args.paste_interpolation
-                    )
-                except Exception as e:
-                    cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", ori_frame)
-                    continue
-
-                # Opt-in teeth correction and lip sharpening of the generated face
-                res_frame = enhance_generated_face(res_frame, args, fp)
-
-                # Fade toward the neutral mouth at the edges of mid-sentence pauses
-                if pause_weight > 0.0 and has_neutral_face:
-                    closed_face = _build_closed_face_for_frame(source_index, (x1, y1, x2, y2))
-                    res_frame = blend_faces(res_frame, closed_face, pause_weight)
-                
-                # Merge results with version-specific parameters
-                try:
-                    if args.version == "v15":
-                        combine_frame = get_image(
-                            ori_frame,
-                            res_frame,
-                            [x1, y1, x2, y2],
-                            mode=args.parsing_mode,
-                            fp=fp,
-                            side_protect_ratio=args.side_protect_ratio,
-                            protect_upper_face=args.protect_upper_face,
-                        )
-                    else:
-                        combine_frame = get_image(
-                            ori_frame,
-                            res_frame,
-                            [x1, y1, x2, y2],
-                            fp=fp,
-                            protect_upper_face=args.protect_upper_face,
-                        )
-                    cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", combine_frame)
-                except Exception as e:
-                    cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", ori_frame)
-
-            if dynamic_plan is not None:
-                print(
-                    f"Open-jaw neck pre-healing: healed {healed_neck_count}/"
-                    f"{len(evaluated_neck_sources)} unique source frames"
-                )
-                healed_neck_roi_cache = None
 
             # Save prediction results
             temp_vid_path = os.path.join(task_directory.name, "rendered.mp4")
@@ -985,12 +1061,12 @@ if __name__ == "__main__":
     parser.add_argument("--parsing_mode", default='jaw', help="Face blending parsing mode")
     parser.add_argument("--left_cheek_width", type=int, default=90, help="Width of left cheek region")
     parser.add_argument("--right_cheek_width", type=int, default=90, help="Width of right cheek region")
-    parser.add_argument("--side_protect_ratio", type=float, default=0.08, help="Side-edge blend protection ratio")
+    parser.add_argument("--side_protect_ratio", type=float, default=0.15, help="Side-edge blend protection ratio")
     parser.add_argument("--bbox_left_ratio", type=float, default=0.0, help="Left bbox adjust ratio; positive expands, negative shrinks")
     parser.add_argument("--bbox_right_ratio", type=float, default=0.0, help="Right bbox adjust ratio; positive expands, negative shrinks")
     parser.add_argument("--bbox_top_ratio", type=float, default=0.0, help="Top bbox adjust ratio; positive expands, negative shrinks")
     parser.add_argument("--bbox_bottom_ratio", type=float, default=0.0, help="Bottom bbox adjust ratio; positive expands, negative shrinks")
-    parser.add_argument("--bbox_smooth_window", type=int, default=1, help="Centered moving-average window for bbox smoothing; 1 disables smoothing")
+    parser.add_argument("--bbox_smooth_window", type=int, default=7, help="Centered moving-average window for bbox smoothing; 1 disables smoothing")
     parser.add_argument("--close_mouth_start", type=parse_bool, default=True, help="Close mouth during leading silence (true/false)")
     parser.add_argument("--close_mouth_end", type=parse_bool, default=False, help="Close mouth during trailing silence (true/false)")
     parser.add_argument("--version", type=str, default="v15", choices=["v1", "v15"], help="Model version to use")
@@ -1017,7 +1093,7 @@ if __name__ == "__main__":
     parser.add_argument("--pause_top_db", type=float, default=38.0, help="Silence threshold below the audio peak, in dB")
     parser.add_argument("--use_audio_pe", type=parse_bool, default=True,
                         help="Add positional encoding to Whisper features (legacy true; for A/B against training)")
-    parser.add_argument("--ref_frame_mode", type=str, default="self", choices=list(REF_FRAME_MODES),
-                        help="UNet reference latent source: 'self' (legacy), 'first' (frame 0), 'offset' (half-cycle), 'auto' (best closed-mouth frontal frame), or 'dynamic' (pose+time nearest open/closed pools + neck pre-heal)")
+    parser.add_argument("--ref_frame_mode", type=str, default="dynamic", choices=list(REF_FRAME_MODES),
+                        help="UNet reference latent source: 'self' (legacy), 'first' (frame 0), 'offset' (half-cycle), 'auto' (best closed-mouth frontal frame), or 'dynamic' (default: pose+time nearest open/closed pools + throat/chin restoration)")
     args = parser.parse_args()
     main(args)

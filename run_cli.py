@@ -503,8 +503,8 @@ def resolve_model_settings(
         use_audio_pe (bool | None): Explicit audio PE flag, or ``None`` to pick
             the resolution default (``True`` for 256, ``False`` for 512).
         ref_frame_mode (str | None): Explicit UNet reference-frame mode, or
-            ``None`` to pick the resolution default (``"self"`` for 256,
-            ``"auto"`` for 512).
+            ``None`` to use ``"dynamic"`` (which automatically falls back to
+            ``"self"`` on closed-mouth templates and single-image inputs).
         batch_size (int | None): Explicit batch size, or ``None`` to pick the
             resolution default (``8`` for 256, ``2`` for 512).
         use_float16 (bool | None): Explicit FP16 toggle, or ``None`` to pick
@@ -545,7 +545,7 @@ def resolve_model_settings(
 
     resolved_audio_pe = (resolved_resolution == 256) if use_audio_pe is None else bool(use_audio_pe)
     resolved_ref_mode = (
-        ("auto" if resolved_resolution == 512 else "self")
+        "dynamic"
         if ref_frame_mode is None
         else validate_ref_frame_mode(ref_frame_mode)
     )
@@ -646,9 +646,9 @@ def main():
     parser.add_argument("--bbox_top_ratio", type=float, default=0.0, help="Top bbox adjust ratio; positive expands, negative shrinks")
     parser.add_argument("--bbox_bottom_ratio", type=float, default=0.0, help="Bottom bbox adjust ratio; positive expands, negative shrinks")
     parser.add_argument("--parsing_mode", type=str, default="jaw", choices=["jaw", "raw"], help="Face blending parsing mode")
-    parser.add_argument("--left_cheek_width", type=int, default=120, help="Width of left cheek editing region")
-    parser.add_argument("--right_cheek_width", type=int, default=120, help="Width of right cheek editing region")
-    parser.add_argument("--side_protect_ratio", type=float, default=0.08, help="Side-edge blend protection ratio")
+    parser.add_argument("--left_cheek_width", type=int, default=90, help="Width of left cheek editing region")
+    parser.add_argument("--right_cheek_width", type=int, default=90, help="Width of right cheek editing region")
+    parser.add_argument("--side_protect_ratio", type=float, default=0.15, help="Side-edge blend protection ratio")
     parser.add_argument("--bbox_smooth_window", type=int, default=7, help="Centered moving-average window for bbox smoothing; 1 disables smoothing")
     parser.add_argument("--close_mouth_start", type=parse_bool, default=True, help="Close mouth during leading silence (true/false)")
     parser.add_argument("--close_mouth_end", type=parse_bool, default=False, help="Close mouth during trailing silence (true/false)")
@@ -681,7 +681,7 @@ def main():
     parser.add_argument("--use_audio_pe", type=parse_bool, default=None,
                         help="Add positional encoding to Whisper features (default: true for 256, false for 512)")
     parser.add_argument("--ref_frame_mode", type=str, default=None, choices=list(REF_FRAME_MODES),
-                        help="UNet reference latent source: 'self', 'first', 'offset', 'auto', or 'dynamic' (default: self for 256, auto for 512)")
+                        help="UNet reference latent source: 'self', 'first', 'offset', 'auto', or 'dynamic' (default: dynamic)")
     parser.add_argument("--max_input_long_edge", type=int, default=DEFAULT_MAX_INPUT_LONG_EDGE,
                         help="Downscale input videos exceeding this long-edge size before inference; 0 disables (default: 1920)")
     
